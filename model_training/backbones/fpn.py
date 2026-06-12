@@ -1,3 +1,8 @@
+"""
+Taken from https://github.com/VSainteuf/utae-paps/blob/main/src/backbones/fpn.py
+authors: Vivien Sainte Fare Garnot and Loic Landrieu  
+"""
+
 import torch.nn as nn
 import torch
 

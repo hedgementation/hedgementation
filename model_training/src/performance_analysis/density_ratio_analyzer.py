@@ -9,7 +9,7 @@ import geopandas as gpd
 import folium
 
 from src.training.train_utils import ModelFactory, Backbones
-from src.training.dataset_dataloader import setup_dataloader
+from src.training.dataloader_utils import setup_dataloader
 from src.training.experiments_registry import deserialize_label_fn
 
 

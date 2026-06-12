@@ -6,7 +6,7 @@ import pandas as pd
 from sklearn.model_selection import KFold
 
 from src.performance_analysis.density_ratio_analyzer import DensityMapGenerator
-from src.training.dataset_dataloader import setup_dataloader
+from src.training.dataloader_utils import setup_dataloader
 from hedgementation_utils.training.metadata_library import MetadataLibrary, SizeGroup
 from src.training.experiments_registry import deserialize_label_fn
 

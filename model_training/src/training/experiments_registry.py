@@ -195,6 +195,17 @@ def _config_default(override):
         cfg.update(override)
     return cfg
 
+def _config_test(override):
+    cfg = _base_config()
+    cfg.update({
+        "keyword": f"UTAE_hedge_{VERSION}_test",
+        "metadata_frames": _get_metadata_library().get_split_metadata(size_group=SizeGroup.SMALL),
+        "datapoint_limit": 2995,
+        "num_epochs": 3
+    })
+    if override:
+        cfg.update(override)
+    return cfg
 
 def _config_train_temperate(override):
     cfg = _base_config()
@@ -246,13 +257,18 @@ def _config_far_group(ind, override):
     return cfg
 
 
-def _config_agriculture_mask(mask_path, keyword_suffix, override):
+def _config_agriculture_and_downsample_mask(rpg_mask_subdir, 
+                             keyword_suffix, 
+                             override=None, 
+                             downsample_masks_dir=None,
+                             provide_rpg_masks: bool = True):
     cfg = _base_config()
     cfg.update({
         "keyword": f"UTAE_hedge_{VERSION}_{keyword_suffix}",
         "metadata_frames": _get_metadata_library().get_split_metadata(size_group=SizeGroup.SMALL),
-        "provide_agriculture_mask": True,
-        "agriculture_mask_path": mask_path,
+        "provide_rpg_masks": provide_rpg_masks,
+        "rpg_mask_subdir": rpg_mask_subdir,
+        "downsample_masks_dir": downsample_masks_dir
     })
     if override:
         cfg.update(override)
@@ -291,12 +307,12 @@ def _config_nuisance_estimation(override):
         "metadata_frames": {"train": train_fold, "valid": pd.concat([near_valid, far_train_valid])},
         "class_weighted": True,
         "class_weights": False,
-        "validation_metric": "loss",
+        "validation_metric": "iou",
         "y_transform": "none",
         "lr_scheduler": LRSchedule.COSINE_ANNEALING,
         "lr_scheduler_args": {"T_max": 100, "eta_min": 1e-6},
-        "early_stopping_min_delta": 0.001,
-        "early_stopping_patience": 50,
+        "early_stopping_min_delta": 0.005,
+        "early_stopping_patience": 15,
         "weight_decay": 1.e-3,
         "additional_model_params": {"out_conv_last_relu": False},
     })
@@ -517,6 +533,37 @@ def _config_random_labels(override):
 def _single(override_template):
     return lambda nb_exp: {0: override_template}
 
+def _config_medium(override):
+    cfg = _base_config()
+    cfg.update({
+        "keyword": f"UTAE_hedge_{VERSION}_medium",
+        "metadata_frames": _get_metadata_library().get_split_metadata(size_group=SizeGroup.MEDIUM),
+    })
+    if override:
+        cfg.update(override)
+    return cfg
+
+def _config_large(override):
+    cfg = _base_config()
+    cfg.update({
+        "keyword": f"UTAE_hedge_{VERSION}_large",
+        "metadata_frames": _get_metadata_library().get_split_metadata(size_group=SizeGroup.LARGE),
+    })
+    if override:
+        cfg.update(override)
+    return cfg
+
+def _config_no_cloud_filter(override):
+    cfg = _base_config()
+    cfg.update({
+        "keyword": f"UTAE_hedge_{VERSION}_test",
+        "metadata_frames": _get_metadata_library().get_split_metadata(size_group=SizeGroup.SMALL),
+        "cloud_threshold": None,
+    })
+    if override:
+        cfg.update(override)
+    return cfg
+
 
 def _nuisance_multi_factory(label_fn, group_index):
     def factory(nb_exp):
@@ -621,6 +668,22 @@ REGISTRY: dict[str, ExperimentDefinition] = {
         config_factory=_config_default,
         multi_experiment_factory=_single({}),
     ),
+    "medium": ExperimentDefinition(
+        config_factory=_config_medium,
+        multi_experiment_factory=_single({}),
+    ),
+    "large": ExperimentDefinition(
+        config_factory=_config_large,
+        multi_experiment_factory=_single({}),
+    ),
+    "no_cloud_filter":  ExperimentDefinition(
+        config_factory=_config_no_cloud_filter,
+        multi_experiment_factory=_single({}),
+    ),
+    "test": ExperimentDefinition(
+        config_factory=_config_test,
+        multi_experiment_factory=_single({}),
+    ),
     "train_temperate": ExperimentDefinition(
         config_factory=_config_train_temperate,
         multi_experiment_factory=_single({}),
@@ -641,25 +704,31 @@ REGISTRY: dict[str, ExperimentDefinition] = {
         for i in range(NUM_TILEGROUPS)
     },
     "agriculture_mask_unbuffered": ExperimentDefinition(
-        config_factory=lambda override: _config_agriculture_mask(
+        config_factory=lambda override: _config_agriculture_and_downsample_mask(
             "rpg_masks_unbuffered", "agriculture_mask_unbuffered", override
         ),
         multi_experiment_factory=_single({}),
     ),
     "agriculture_mask_buffered_10m": ExperimentDefinition(
-        config_factory=lambda override: _config_agriculture_mask(
-            "rpg_masks_buffered_10m", "agriculture_mask_buffered_10m", override
+        config_factory=lambda override: _config_agriculture_and_downsample_mask(
+            "rpg_masks_buffered_10m", "agriculture_mask_buffered_10m", override, "rpg_mask_unbuffered"
+        ),
+        multi_experiment_factory=_single({}),
+    ),
+    "downsample_to_unbuffered": ExperimentDefinition(
+        config_factory=lambda override: _config_agriculture_and_downsample_mask(
+            "", "", override, "rpg_mask_unbuffered", False
         ),
         multi_experiment_factory=_single({}),
     ),
     "agriculture_mask_unbuffered_inverted": ExperimentDefinition(
-        config_factory=lambda override: _config_agriculture_mask(
+        config_factory=lambda override: _config_agriculture_and_downsample_mask(
             "rpg_masks_unbuffered_inverted", "agriculture_mask_unbuffered_inverted", override
         ),
         multi_experiment_factory=_single({}),
     ),
     "agriculture_mask_buffered_10m_inverted": ExperimentDefinition(
-        config_factory=lambda override: _config_agriculture_mask(
+        config_factory=lambda override: _config_agriculture_and_downsample_mask(
             "rpg_masks_buffered_10m_inverted", "agriculture_mask_buffered_10m_inverted", override
         ),
         multi_experiment_factory=_single({}),

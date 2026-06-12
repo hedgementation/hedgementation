@@ -1,3 +1,7 @@
+"""
+Taken from https://github.com/VSainteuf/utae-paps/blob/main/src/backbones/positional_encoding.py
+authors: Vivien Sainte Fare Garnot and Loic Landrieu  
+"""
 import torch
 import torch.nn as nn
 

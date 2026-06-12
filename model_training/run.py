@@ -1,5 +1,7 @@
+import logging
 import os
 import re
+import sys
 import argparse
 import debugpy
 from dotenv import load_dotenv
@@ -14,9 +16,12 @@ from utils import (
     get_multi_experiment_overrides,
 )
 from src.training.experiments_registry import REGISTRY
+from src.logging_utils import setup_logging
 from scripts.submit_experiments import create_slurm_script, _GPU_SLURM_DIRECTIVES, DEFAULT_DATA_ARCHIVE
 
 load_dotenv()
+setup_logging()
+logger = logging.getLogger(__name__)
 NUM_TILEGROUPS = int(os.environ.get("NUM_TILEGROUPS", "5"))
 
 
@@ -43,29 +48,34 @@ def run(
     num_workers=None,
     data_archive=DEFAULT_DATA_ARCHIVE,
     cache_dir=None,
+    smoke_test=False,
 ):
     if prepare_only and run_only:
-        print("✗ Error: --prepare_only and --run_only are mutually exclusive")
+        logger.error("✗ --prepare_only and --run_only are mutually exclusive")
         return 1
- 
+
+    if slurm and smoke_test:
+        logger.error("✗ --smoke_test runs locally; don't combine it with --slurm")
+        return 1
+
     if cpus_per_task is not None:
         if num_workers is None:
-            num_workers = cpus_per_task 
+            num_workers = cpus_per_task
 
         elif num_workers > cpus_per_task:
-            print(f"✗ Error: --num_workers ({num_workers}) must be <= --cpus_per_task ({cpus_per_task})")
+            logger.error(f"✗ --num_workers ({num_workers}) must be <= --cpus_per_task ({cpus_per_task})")
             return 1
 
     if slurm_worker:
         if experiment_dir is None:
-            print("✗ Error: --slurm_worker requires --experiment_dir")
+            logger.error("✗ --slurm_worker requires --experiment_dir")
             return 1
-        
+
         exp_root = os.path.dirname(experiment_dir)
         exp_name = os.path.basename(experiment_dir)
         match = re.match(r"experiment_(\d+)$", exp_name)
         if not match:
-            print(f"✗ Error: Cannot parse experiment index from '{exp_name}'")
+            logger.error(f"✗ Cannot parse experiment index from '{exp_name}'")
             return 1
         exp_idx = int(match.group(1))
 
@@ -74,7 +84,7 @@ def run(
             return 1
 
         if exp_idx not in config_dict:
-            print(f"✗ Error: Experiment {exp_idx} not found after loading '{exp_root}'")
+            logger.error(f"✗ Experiment {exp_idx} not found after loading '{exp_root}'")
             return 1
         single = {exp_idx: config_dict[exp_idx]}
 
@@ -87,62 +97,60 @@ def run(
             cache_dir=cache_dir,
             num_workers=num_workers,
             batch_size=batch_size,
+            smoke_test=smoke_test,
         )
 
     if not run_only:
-        print("\n")
-        print("=" * 10)
-        print("Creating directories...")
-        print("=" * 10)
+        logger.info("=" * 10)
+        logger.info("Creating directories...")
+        logger.info("=" * 10)
 
         if output_dir is None:
-            print("\nWarning 'output_dir' not provided. Results won't be saved")
+            logger.warning("'output_dir' not provided. Results won't be saved")
         else:
             try:
                 os.makedirs(output_dir, exist_ok=True)
-                print(f"\n✓ Successfully created {output_dir}")
+                logger.info(f"✓ Successfully created {output_dir}")
             except Exception as e:
-                print(f"  Error: {e}")
-                print(f"\n✗ Error: Failed creating {output_dir}")
+                logger.error(f"  Error: {e}")
+                logger.error(f"✗ Failed creating {output_dir}")
                 return 1
 
         if experiments_dir is None:
-            print("\nWarning 'experiments_dir' not provided")
-            print("\nDefault 'experiments_dir' is set to 'experiments'")
+            logger.warning("'experiments_dir' not provided")
+            logger.warning("Default 'experiments_dir' is set to 'experiments'")
             experiments_dir = "experiments"
 
         try:
             os.makedirs(experiments_dir, exist_ok=True)
-            print(f"\n✓ Successfully created {experiments_dir}")
+            logger.info(f"✓ Successfully created {experiments_dir}")
         except Exception as e:
-            print(f"  Error: {e}")
-            print(f"\n✗ Error: Failed creating {experiments_dir}")
+            logger.error(f"  Error: {e}")
+            logger.error(f"✗ Failed creating {experiments_dir}")
             return 1
 
-        print("\n")
-        print("=" * 10)
-        print("Keywords verification...")
-        print("=" * 10)
+        logger.info("=" * 10)
+        logger.info("Keywords verification...")
+        logger.info("=" * 10)
 
         if keywords is None:
-            print("Warning: no keyword specified")
+            logger.warning("no keyword specified")
         elif not isinstance(keywords, list):
-            print(f"✗ Error: 'keywords' is not a list: {keywords}")
+            logger.error(f"✗ 'keywords' is not a list: {keywords}")
             return 1
         else:
             existing_keywords = list(REGISTRY.keys())
             for keyword in keywords:
                 if keyword not in existing_keywords:
-                    print(f"✗ Error: keyword '{keyword}' is not a predefined keyword")
-                    print(f"Keywords must be taken from: {existing_keywords}")
+                    logger.error(f"✗ keyword '{keyword}' is not a predefined keyword")
+                    logger.error(f"Keywords must be taken from: {existing_keywords}")
                     return 1
 
-        print("✓ Keywords Successfully verified")
+        logger.info("✓ Keywords Successfully verified")
 
-        print("\n")
-        print("=" * 10)
-        print("Predefined experiments preparation...")
-        print("=" * 10)
+        logger.info("=" * 10)
+        logger.info("Predefined experiments preparation...")
+        logger.info("=" * 10)
 
         keyword_map = {}
         try:
@@ -153,21 +161,20 @@ def run(
                         sub_keyword = f"{kw}_{i}"
                         config = TrainerConfig.get_predefined_config(kw, override=override)
                         keyword_map[sub_keyword] = config
-                        print(f"✓ Successfully created sub-keyword {sub_keyword}")
-                    print(f"✓ Successfully handled multi-experiment {kw}: {len(overrides_dict)} created")
+                        logger.info(f"✓ Successfully created sub-keyword {sub_keyword}")
+                    logger.info(f"✓ Successfully handled multi-experiment {kw}: {len(overrides_dict)} created")
                 else:
                     config = TrainerConfig.get_predefined_config(kw, override=overrides_dict[0])
                     keyword_map[kw] = config
-                    print(f"✓ Successfully handled single-experiment {kw}")
+                    logger.info(f"✓ Successfully handled single-experiment {kw}")
         except Exception as e:
-            print(f"  Error: {e}")
-            print(f"✗ Error: Failed creating keyword map")
+            logger.error(f"  Error: {e}")
+            logger.error("✗ Failed creating keyword map")
             return 1
 
-        print("\n")
-        print("=" * 10)
-        print("Predefined experiments saving...")
-        print("=" * 10)
+        logger.info("=" * 10)
+        logger.info("Predefined experiments saving...")
+        logger.info("=" * 10)
 
         try:
             save_exp = save_experiments(
@@ -176,15 +183,15 @@ def run(
                 matching_path="predefined_experiments_matching.json",
             )
             if save_exp == 0:
-                print(f"✓ Successfully saved {len(keyword_map)} experiments in {experiments_dir}")
+                logger.info(f"✓ Successfully saved {len(keyword_map)} experiments in {experiments_dir}")
                 if prepare_only:
                     return 0
             else:
-                print(f"✗ Error: Failed to save predefined experiments in {experiments_dir}")
+                logger.error(f"✗ Failed to save predefined experiments in {experiments_dir}")
                 return 1
         except Exception as e:
-            print(f"  Error: {e}")
-            print(f"✗ Error: Failed to save predefined experiments in {experiments_dir}")
+            logger.error(f"  Error: {e}")
+            logger.error(f"✗ Failed to save predefined experiments in {experiments_dir}")
             return 1
 
         num_experiments = len(keyword_map)
@@ -197,9 +204,9 @@ def run(
                 if pattern.match(item)
             )
 
-        print("\n" + "=" * 10)
-        print("SLURM submission...")
-        print("=" * 10)
+        logger.info("=" * 10)
+        logger.info("SLURM submission...")
+        logger.info("=" * 10)
 
         os.makedirs("logs", exist_ok=True)
         os.makedirs("results", exist_ok=True)
@@ -219,67 +226,66 @@ def run(
             num_workers=num_workers,
             batch_size=batch_size,
             data_archive=data_archive,
+            experiments_dir=experiments_dir,
         )
 
-        print(f"✓ Script created: {script_path}")
-        print(f"\nJob configuration:")
-        print(f"  Account      : {account}")
-        print(f"  Time limit   : {time_limit}")
-        print(f"  Mem per CPU  : {mem_per_cpu}")
-        print(f"  CPUs per task: {cpus_per_task}")
-        print(f"  Max parallel : {max_parallel}")
+        logger.info(f"✓ Script created: {script_path}")
+        logger.info("Job configuration:")
+        logger.info(f"  Account      : {account}")
+        logger.info(f"  Time limit   : {time_limit}")
+        logger.info(f"  Mem per CPU  : {mem_per_cpu}")
+        logger.info(f"  CPUs per task: {cpus_per_task}")
+        logger.info(f"  Max parallel : {max_parallel}")
         if gpu_config:
-            print(f"  GPU config   : {gpu_config}  ({_GPU_SLURM_DIRECTIVES[gpu_config].lstrip('#SBATCH ')})")
+            logger.info(f"  GPU config   : {gpu_config}  ({_GPU_SLURM_DIRECTIVES[gpu_config].lstrip('#SBATCH ')})")
 
         if generate_only:
-            print("\n--generate_only set. Skipping execution.")
-            print("To submit manually: sbatch scripts/slurm_array_job_generated.sh")
+            logger.info("--generate_only set. Skipping execution.")
+            logger.info("To submit manually: sbatch scripts/slurm_array_job_generated.sh")
             return 0
 
         if dry_run:
-            print(f"\n--dry_run set. Would run: sbatch {script_path}")
+            logger.info(f"--dry_run set. Would run: sbatch {script_path}")
             return 0
 
-        print("\nSubmitting to SLURM...")
+        logger.info("Submitting to SLURM...")
         try:
             result = subprocess.run(
                 ["sbatch", script_path],
                 capture_output=True, text=True, check=True,
             )
-            print(result.stdout)
+            logger.info(result.stdout)
             if "Submitted batch job" in result.stdout:
                 job_id = result.stdout.split()[-1]
-                print(f"✓ Submitted job array: {job_id}")
-                print(f"Monitor: squeue -u $USER")
-                print(f"Logs in: logs/")
+                logger.info(f"✓ Submitted job array: {job_id}")
+                logger.info("Monitor: squeue -u $USER")
+                logger.info("Logs in: logs/")
         except subprocess.CalledProcessError as e:
-            print(f"✗ sbatch error: {e.stderr}")
+            logger.error(f"✗ sbatch error: {e.stderr}")
             return 1
         except FileNotFoundError:
-            print("✗ sbatch not found. Are you on a SLURM cluster?")
+            logger.error("✗ sbatch not found. Are you on a SLURM cluster?")
             return 1
         return 0
 
-    print("\n")
-    print("=" * 10)
-    print("Predefined experiments reading...")
-    print("=" * 10)
+    logger.info("=" * 10)
+    logger.info("Predefined experiments reading...")
+    logger.info("=" * 10)
 
     try:
         loaded = load_experiments(experiments_dir)
         if loaded == 1:
-            print("✗ Error: Failed reading predefined experiments")
+            logger.error("✗ Failed reading predefined experiments")
             return 1
-        print(f"✓ Successfully loaded {len(loaded)} configurations.")
+        logger.info(f"✓ Successfully loaded {len(loaded)} configurations.")
     except Exception as e:
-        print(f"  Error: {e}")
-        print("✗ Error: Failed reading predefined experiments")
+        logger.error(f"  Error: {e}")
+        logger.error("✗ Failed reading predefined experiments")
         return 1
 
-    print("\n")
-    print("=" * 10)
-    print("Training (predefined experiments)...")
-    print("=" * 10)
+    logger.info("=" * 10)
+    logger.info("Training (predefined experiments)...")
+    logger.info("=" * 10)
 
     if loaded:
         try:
@@ -292,17 +298,18 @@ def run(
                 cache_dir=cache_dir,
                 num_workers=num_workers,
                 batch_size=batch_size if batch_size != 4 else None,
+                smoke_test=smoke_test,
             )
             if result == 1:
-                print("✗ Error: Training failed")
+                logger.error("✗ Training failed")
                 return 1
-            print("✓ Training of every predefined experiment completed successfully")
+            logger.info("✓ Training of every predefined experiment completed successfully")
         except Exception as e:
-            print(f"  Error: {e}")
-            print("✗ Error: Training failed")
+            logger.error(f"  Error: {e}")
+            logger.error("✗ Training failed")
             return 1
     else:
-        print("Training cancelled: no predefined experiments found")
+        logger.warning("Training cancelled: no predefined experiments found")
 
     return 0
 
@@ -363,25 +370,28 @@ if __name__ == "__main__":
                         help="Number of dataloader workers. Defaults to cpus_per_task. Must be <= cpus_per_task.")
     parser.add_argument("--data_archive", type=str, default=DEFAULT_DATA_ARCHIVE,
                         help="Dataset archive filename under $DATASET_ROOT")
+    parser.add_argument("--smoke_test", action="store_true",
+                        help="Sanity-check run: 1 epoch on a few datapoints, evals skipped. "
+                             "Use locally to validate the pipeline before submitting to SLURM.")
 
     args = parser.parse_args()
 
-    print("=" * 10)
-    print("Starting run.py")
-    print("=" * 10)
+    logger.info("=" * 10)
+    logger.info("Starting run.py")
+    logger.info("=" * 10)
 
     if args.debug:
         debugpy.listen(("0.0.0.0", 5678))
-        print("Waiting for debugger...")
+        logger.info("Waiting for debugger...")
         debugpy.wait_for_client()
-        print("Debugger attached!")
+        logger.info("Debugger attached!")
 
     keywords = None
     if args.keywords:
         try:
             keywords = [k.strip() for k in args.keywords.split(",")]
         except Exception as e:
-            print(f"✗ Failed parsing --keywords: {e}")
+            logger.error(f"✗ Failed parsing --keywords: {e}")
 
     result = run(
         output_dir=args.output_dir,
@@ -406,9 +416,11 @@ if __name__ == "__main__":
         num_workers=args.num_workers,
         data_archive=args.data_archive,
         cache_dir=args.cache_dir,
+        smoke_test=args.smoke_test,
     )
 
     if result == 0:
-        print("✓ run.py terminated successfully")
+        logger.info("✓ run.py terminated successfully")
     else:
-        print("✗ run.py failed")
+        logger.error("✗ run.py failed")
+    sys.exit(result)

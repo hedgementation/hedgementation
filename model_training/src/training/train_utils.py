@@ -1,13 +1,10 @@
 import copy
 import os
-import random
 from typing import Any
-import numpy as np
 import torch
 from dotenv import load_dotenv
 load_dotenv()
 from enum import Enum
-from backbones.convlstm import ConvLSTM
 from backbones.unet3d import UNet3D
 from backbones.utae import UTAE
 
@@ -168,66 +165,6 @@ def calculate_class_weights(dataloader, num_classes, device):
     print(f"class_weights: {class_weights}")
     return class_weights.to(device)
 
-
-def collate_fn(batch):
-    # Check if masks are present
-    has_masks = len(batch[0]) == 3
-
-    if has_masks:
-        inputs, targets, masks = zip(*batch)
-    else:
-        inputs, targets = zip(*batch)
-
-    # Check if X_cloud is present (inputs are 3-tuples)
-    has_cloud = len(inputs[0]) == 3
-
-    if has_cloud:
-        X_list, dates_list, cloud_list = zip(*inputs)
-    else:
-        X_list, dates_list = zip(*inputs)
-
-    max_len = max(x.shape[0] for x in X_list)
-
-    X_padded = []
-    dates_padded = []
-    cloud_padded = []
-
-    for i, (X, dates) in enumerate(zip(X_list, dates_list)):
-        seq_len = X.shape[0]
-        dates_len = dates.shape[0]
-        if seq_len < max_len:
-            pad_size = max_len - seq_len
-            X_pad = torch.full((pad_size, *X.shape[1:]), 0, dtype=X.dtype)
-            X = torch.cat([X, X_pad], dim=0)
-        if dates_len < max_len:
-            pad_size = max_len - dates_len
-            dates_pad = torch.full((pad_size,), -1, dtype=dates.dtype)
-            dates = torch.cat([dates, dates_pad], dim=0)
-
-        X_padded.append(X)
-        dates_padded.append(dates)
-
-        if has_cloud:
-            X_cloud = cloud_list[i]
-            cloud_len = X_cloud.shape[0]
-            if cloud_len < max_len:
-                pad_size = max_len - cloud_len
-                cloud_pad = torch.full((pad_size, *X_cloud.shape[1:]), 0, dtype=X_cloud.dtype)
-                X_cloud = torch.cat([X_cloud, cloud_pad], dim=0)
-            cloud_padded.append(X_cloud)
-
-    X_batch = torch.stack(X_padded)
-    dates_batch = torch.stack(dates_padded)
-    y_batch = torch.stack(targets)
-
-    inputs_batch = (X_batch, dates_batch, torch.stack(cloud_padded)) if has_cloud else (X_batch, dates_batch)
-
-    if has_masks:
-        mask_keys = masks[0].keys()
-        masks_batch = {k: torch.stack([m[k] for m in masks]) for k in mask_keys}
-        return inputs_batch, y_batch, masks_batch
-    else:
-        return inputs_batch, y_batch
     
 
 def find_layers_to_load(model_state_dict, pretrained_state_dict):
@@ -259,4 +196,3 @@ def adapt_state_dict(model: torch.nn.Module,
     
     return model_state_dict
 
-    

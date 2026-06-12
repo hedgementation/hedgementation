@@ -16,7 +16,6 @@ from typing import Any, ClassVar, List, Optional, Tuple
 from hedgementation_utils.training.metadata_library import MetadataLibrary, SizeGroup
 import torch
 
-from src.training.dataset_dataloader import setup_dataloader
 from src.training.train_utils import Backbones, LRSchedule
 from src.training.transforms import Normalization, YTransform
 import geopandas as gpd
@@ -31,10 +30,6 @@ from src.performance_analysis.reg_meter import REGRESSION_METRICS, CLASSIFICATIO
 
 
 load_dotenv()
-DATASET_ROOT = os.environ.get("DATASET_ROOT", "")
-NUM_TILEGROUPS = int(os.environ.get("NUM_TILEGROUPS",5))
-MODEL_DIR = os.environ.get("MODEL_DIR", "models")
-VERSION = os.environ.get("VERSION", "1.2")
 
 metadata_library = MetadataLibrary()
 
@@ -51,7 +46,7 @@ class TrainerConfig:
         num_buckets: Number of classification buckets
         additional_model_params: Optional additional model parameters
         checkpoint_path: Path to checkpoint for resuming training
-        data_path: Root directory of dataset
+        dataset_root: Root directory of dataset
         image_count: Number of images per sample
         batch_size: Batch size for training
         use_memmap: Whether to use memory-mapped files
@@ -72,7 +67,7 @@ class TrainerConfig:
         lr_scheduler_patience: Patience for learning rate scheduler
         early_stopping_patience: Patience for early stopping
         early_stopping_min_delta: Minimum delta for early stopping
-        provide_agriculture_mask: Whether or not to mask out non-agricultural pixels before calculating loss
+        provide_rpg_masks: Whether or not to provide RPG masks, using them to mask out pixels before loss calculation
         validation_metric: Metric used to select the best model and drive early stopping.
             Classification options : "iou" (default), "f1", "precision", "recall".
             Regression options     : "mae", "mse", "rmse", "r2".
@@ -91,19 +86,23 @@ class TrainerConfig:
     checkpoint_path: Optional[str] = None
 
     # Data configuration
-    data_path: str = None  # Will be set from environment
+    dataset_root: str = os.environ.get("DATASET_ROOT", None)
+    reference_date: str = "2021-09-17"
+    target_size: int = 128
     size_group: SizeGroup = SizeGroup.SMALL
     image_count: int = 10
     batch_size: int = 16
+    eval_batch_size: Optional[int] = 32
     use_memmap: bool = False
     metadata_frames: Optional[dict[str,gpd.GeoDataFrame]] = None
     load_X_cloud: bool = True
     load_y_id: bool = False
     cloud_threshold: Optional[float] = 0.2
     cloud_band: int = 0
-    cache_dir: Optional[str] = None
+    cache_dir: Optional[str] = os.environ.get("CACHE_DIR", None)
     io_manager_kwargs: Optional[dict] = None
     num_workers: int = 8
+    datapoint_limit: int = None
 
     # Training configuration
     num_epochs: int = 100
@@ -111,6 +110,9 @@ class TrainerConfig:
     weight_decay: float = 1e-4
     device: Optional[str] = None
     trainable_params: Optional[list[str]] = None
+    skip_untrained_eval: bool = False
+    skip_final_eval: bool = False
+    skip_full_dataset_inference: bool = False
 
     # Preprocessing configuration
     normalization: Normalization = Normalization.MINMAX
@@ -124,10 +126,10 @@ class TrainerConfig:
     class_weighted: bool = False
     class_weights: Optional[List[float]] = None
     regression: bool = False
-    provide_agriculture_mask: bool = False
-    agriculture_mask_path: Optional[str] = None
+    provide_rpg_masks: bool = False
+    rpg_mask_subdir: Optional[str] = None
     downsample_loss: bool = False
-    downsample_mask_path: Optional[str] = None
+    downsample_mask_dir: Optional[str] = None
     validation_metric: str = "iou"
 
     # Scheduler and early stopping
@@ -138,17 +140,12 @@ class TrainerConfig:
     early_stopping_min_delta: float = 0
 
     # Persistence configuration
-    save_path: str = MODEL_DIR
+    save_path: str = os.environ.get("MODEL_DIR", "models")
     keyword: Optional[str] = None
     save_results: bool = True
     overwrite: bool = True
 
     def __post_init__(self):
-        """Validate configuration parameters."""
-        # Set default data_path from environment if not provided
-        if self.data_path is None:
-            self.data_path = os.environ.get("DATASET_ROOT", "")
-
         if isinstance(self.y_transform, str):
             self.y_transform = YTransform[self.y_transform.upper()]
 
@@ -206,6 +203,9 @@ class TrainerConfig:
             for k in self.metadata_frames:
                 if isinstance(self.metadata_frames[k], str):
                     self.metadata_frames[k] = gpd.read_file(self.metadata_frames[k])
+            if self.datapoint_limit:
+                for k in self.metadata_frames:
+                    self.metadata_frames[k] = self.metadata_frames[k][:min(len(self.metadata_frames[k]), self.datapoint_limit)]
 
     @classmethod
     def from_dict(cls, data: dict):
@@ -239,6 +239,7 @@ class TrainerConfig:
             "y_threshold": self.y_threshold,
             "class_weighted": self.class_weighted,
             "batch_size": self.batch_size,
+            "eval_batch_size": self.eval_batch_size,
             "num_workers": self.num_workers,
             "class_weights": (
                 "autocalculated"
@@ -259,10 +260,10 @@ class TrainerConfig:
             "early_stopping_min_delta": self.early_stopping_min_delta,
             "inclusion_intervals": self.inclusion_intervals,
             "additional_model_params": self.additional_model_params,
-            "provide_agriculture_mask": self.provide_agriculture_mask,
-            "agriculture_mask_path": self.agriculture_mask_path,
+            "provide_rpg_masks": self.provide_rpg_masks,
+            "rpg_mask_subdir": self.rpg_mask_subdir,
             "downsample_loss": self.downsample_loss,
-            "downsample_mask_path": self.downsample_mask_path,
+            "downsample_mask_dir": self.downsample_mask_dir,
             "load_X_cloud": self.load_X_cloud,
             "load_y_id": self.load_y_id,
             "cloud_threshold": self.cloud_threshold,
@@ -274,22 +275,23 @@ class TrainerConfig:
     
     def setup_dataloader_from_config(self,
                                  metadata_frame: Optional[gpd.GeoDataFrame] = None):
+        from src.training.dataloader_utils import setup_dataloader
         if metadata_frame is None:
-            metadata_frame = gpd.read_file(os.path.join(DATASET_ROOT, "metadata.geojson"))
+            metadata_frame = gpd.read_file(os.path.join(self.dataset_root, "metadata.geojson"))
 
         return setup_dataloader(
             metadata_frame=metadata_frame,
-            data_path=DATASET_ROOT,
+            data_path=self.dataset_root,
             image_count=self.image_count,
             num_buckets=self.num_buckets,
             normalization=self.normalization,
             y_transform=self.y_transform,
             inclusion_intervals=self.inclusion_intervals,
             batch_size=self.batch_size,
-            provide_agriculture_masks=self.provide_agriculture_mask,
-            agriculture_mask_path=self.agriculture_mask_path,
+            provide_agriculture_masks=self.provide_rpg_masks,
+            agriculture_mask_path=self.rpg_mask_subdir,
             downsample_loss=self.downsample_loss,
-            downsample_mask_path=self.downsample_mask_path,
+            downsample_mask_path=self.downsample_mask_dir,
             load_X_cloud=self.load_X_cloud,
             load_y_id=self.load_y_id,
             cloud_threshold=self.cloud_threshold,

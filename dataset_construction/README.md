@@ -23,7 +23,7 @@ Firstly, download necessary Python packages and setup environment variables.
 
 - Run ``pip install -r requirements.txt``.
 
-- Run ``pip install git+ssh://github.com/hedgementation/hedgementation_utils``. This will install a shared util repo for the Hedgementation project that is necessary for the rest of the project to run.
+- Run ``pip install ../hedgementation_utils``. This will install a shared util repo for the Hedgementation project that is necessary for the rest of the project to run.
 
 - Copy ``example.env`` into ``.env``, replacing the variables marked **TODO** with the appropriate values for your local setup.
 

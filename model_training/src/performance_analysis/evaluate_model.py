@@ -1,4 +1,6 @@
+import gc
 import json
+import logging
 import os
 import sys
 from typing import Union
@@ -10,18 +12,29 @@ import seaborn as sns
 from torchmetrics import JaccardIndex
 import geopandas as gpd
 
+from hedgementation_utils.metrics.per_hedge_analysis import calc_hedge_detection_rate, calc_mean_hedge_accuracy, calc_patch_per_hedge_accuracy
 from src.training.train_utils import soft_labels_to_hard_labels
 from src.training.transforms import YTransform
 
 from src.performance_analysis.reg_meter import RegMeter
+import tracemalloc
 from hedgementation_utils.metrics.seg_meter import SegMeter
 
-
+from datetime import datetime
 
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
 from typing import Union, Optional, Tuple
+
+logger = logging.getLogger(__name__)
+
+
+def _cuda_sync(device) -> None:
+    """Wait for queued CUDA work so wall-clock timings reflect real durations."""
+    if torch.cuda.is_available() and str(device) != "cpu":
+        torch.cuda.synchronize(device)
+
 
 def _progress_bar(current: int, total: int, prefix: str = "", bar_width: int = 30) -> None:
     filled = int(bar_width * current / total) if total > 0 else 0
@@ -33,7 +46,12 @@ def _progress_bar(current: int, total: int, prefix: str = "", bar_width: int = 3
         sys.stdout.write("\n")
         sys.stdout.flush()
         
-def get_model_predictions(model, dataloader, y_transform, device=None, regression = False):
+def get_model_predictions(model, 
+                          dataloader, 
+                          y_transform, 
+                          load_y_id=False, 
+                          device=None, 
+                          regression = False):
     """
     Get predictions and labels for a model on a dataloader.
     
@@ -56,35 +74,30 @@ def get_model_predictions(model, dataloader, y_transform, device=None, regressio
     all_labels = []
     total = len(dataloader)
 
-    skipped = 0
     with torch.no_grad():
         for batch_idx, item in enumerate(dataloader):
             _progress_bar(batch_idx + 1, total, prefix="  Evaluating ")
-            try:
+            
+            if load_y_id:
+                input_tuple, labels, masks, *_ = item
+            else:
                 input_tuple, labels, *_ = item
-                inputs, dates = input_tuple[0], input_tuple[1]
-                inputs = inputs.to(device)
-                dates = dates.to(device)
-                labels = labels.to(device)
+            inputs, dates = input_tuple[0], input_tuple[1]
+            inputs = inputs.to(device, non_blocking=True)
+            dates = dates.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
 
-                outputs = model(inputs, batch_positions=dates)
+            outputs = model(inputs, batch_positions=dates)
 
-                if regression:
-                    preds = outputs 
-                else:
-                    preds = torch.argmax(outputs, dim=1)
-                    if y_transform == YTransform.SOFT_TARGETS:
-                        labels = soft_labels_to_hard_labels(labels)
-                
-                all_preds.append(preds)
-                all_labels.append(labels)
-            except RuntimeError as e:
-                print(f"\n  WARNING: Skipping batch {batch_idx} due to RuntimeError: {e}")
-                skipped += 1
-                continue
+            if regression:
+                preds = outputs
+            else:
+                preds = torch.argmax(outputs, dim=1)
+                if y_transform == YTransform.SOFT_TARGETS:
+                    labels = soft_labels_to_hard_labels(labels)
 
-    if skipped > 0:
-        print(f"\n  WARNING: Skipped {skipped}/{total} batches due to RuntimeError.")
+            all_preds.append(preds)
+            all_labels.append(labels)
 
     all_preds = torch.cat(all_preds).cpu()
     all_labels = torch.cat(all_labels).cpu()
@@ -95,10 +108,11 @@ def calculate_all_metrics(labels: torch.Tensor,
                           preds: torch.Tensor,
                           num_buckets=1,
                           regression: bool = False,
-                          return_as_tuple=False):
+                          return_as_tuple=False,
+                          meter: Optional[RegMeter|SegMeter] = None):
 
     if regression:
-        meter = RegMeter()
+        meter = (meter or RegMeter())
         meter.update(preds, labels)
         metrics = meter.ask_metrics()
 
@@ -107,7 +121,7 @@ def calculate_all_metrics(labels: torch.Tensor,
         return metrics
     
     else:
-        seg_meter = SegMeter(num_classes=num_buckets+1)
+        seg_meter = (meter or SegMeter(num_classes=num_buckets+1))
         seg_meter.update_batch(preds, labels)    
         metrics = seg_meter.ask_metrics()
         metrics["precision"] = metrics.pop("pre")
@@ -405,6 +419,50 @@ def save_confusion_matrix(all_preds: torch.Tensor,
     plt.savefig(f"{save_path}/imgs/{file_prefix}_{split}_conf_matrix.png")
     plt.clf()
 
+def calc_per_hedge(preds, 
+                   id_masks, 
+                   meter):
+        patch_per_hedge_acc = calc_patch_per_hedge_accuracy(
+            predictions=preds.cpu(),
+            target_raster=id_masks,
+            seg_meter=meter,
+        )
+        
+        mean_hedge_accuracy = calc_mean_hedge_accuracy(patch_per_hedge_acc).item()
+        hedge_detection_rate = calc_hedge_detection_rate(patch_per_hedge_acc).item()
+
+        return patch_per_hedge_acc, mean_hedge_accuracy, hedge_detection_rate
+
+
+def get_batch_predictions(model, 
+                          item, 
+                          y_transform, 
+                          load_y_id=False, 
+                          device=None, 
+                          regression = False):
+    with torch.no_grad():
+        if load_y_id:
+            input_tuple, labels, masks, *_ = item
+        else:
+            input_tuple, labels, *_ = item
+        inputs, dates = input_tuple[0], input_tuple[1]
+        inputs = inputs.to(device, non_blocking=True)
+        dates = dates.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+
+        outputs = model(inputs, batch_positions=dates)
+
+        if regression:
+            preds = outputs 
+        else:
+            preds = torch.argmax(outputs, dim=1)
+            if y_transform == YTransform.SOFT_TARGETS:
+                labels = soft_labels_to_hard_labels(labels)
+
+        if load_y_id:
+            y_id = masks["y_id"]
+            return preds.detach(), labels.detach(), y_id
+        return preds.detach(), labels.detach()
 
 def evaluate_model(model, 
                    dataloaders: torch.utils.data.DataLoader, 
@@ -412,6 +470,7 @@ def evaluate_model(model,
                    save_path: str, 
                    num_buckets: int, 
                    y_transform: YTransform,
+                   load_y_id: bool = False,
                    regression: bool = False, 
                    save_extra_info: bool=False, 
                    device=None, 
@@ -419,29 +478,75 @@ def evaluate_model(model,
     """
     Evaluate model classification performance across multiple dataloaders.
     """
-    print("calculating model evaluations")
-    
+    logger.info("calculating model evaluations")
+
     if device is None:
         device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    logger.info(f"Evaluating on device: {device}")
 
     data_dict = {}
 
+    meter = RegMeter() if regression else SegMeter(num_classes=num_buckets+1)
+    if load_y_id:
+        per_hedge_acc = []
     for k in dataloaders:
+        overall_start = datetime.now()
         dataloader = dataloaders[k]
-        all_preds, all_labels = get_model_predictions(model, dataloader, y_transform, device, regression=regression)
-        
-        if save_extra_info:
-            save_sample_predictions(
-                model,
-                dataloader,
-                save_path,
-                file_prefix,
-                device
+        starttime = datetime.now()
+        dataloader_time = 0
+        predict_time = 0
+        meter_time = 0
+        with torch.no_grad():
+            for batch_idx, item in enumerate(dataloader):
+                time = datetime.now()
+                load_seconds = (time - starttime).total_seconds()
+                dataloader_time += load_seconds
+                _progress_bar(batch_idx + 1, len(dataloader), prefix="  Evaluating ")
 
-            )
-        
+                starttime = datetime.now()
+                res = get_batch_predictions(
+                    model=model,
+                    item=item,
+                    y_transform=y_transform,
+                    load_y_id=load_y_id,
+                    device=device,
+                    regression=regression
+                )
+                # CUDA ops are async; without a sync the forward's cost would be
+                # misattributed to whichever later phase first touches the result.
+                _cuda_sync(device)
+                time = datetime.now()
+                load_seconds = (time - starttime).total_seconds()
+                predict_time += load_seconds
+
+                if load_y_id:
+                    preds, labels, y_id = res
+                else:
+                    preds,labels = res
+
+                starttime = datetime.now()
+                meter.update_batch(
+                    output=preds,
+                    target=labels
+                )
+                _cuda_sync(device)
+                time = datetime.now()
+                load_seconds = (time - starttime).total_seconds()
+                meter_time += load_seconds
+
+                if load_y_id:
+                    #TODO efficient vectorized per-hedge metric calculation
+                    pass
+                starttime = datetime.now()
+
+            total_time = (datetime.now() - overall_start).total_seconds()
+            logger.info(f"Total time for dataset pass: {total_time}")
+            logger.info(f"Dataloader took {dataloader_time:.2f} total seconds({100 * (dataloader_time / total_time):.2f}% of total)")
+            logger.info(f"Inference took {predict_time:.2f} total seconds({100 * (predict_time / total_time):.2f}% of total)")
+            logger.info(f"Recording metrics took {meter_time:.2f} total seconds({100 * (meter_time / total_time):.2f}% of total)")
+        metrics_dict = meter.ask_metrics()
         if regression:
-            mae, mse, rmse, r2 = calculate_all_metrics(all_labels, all_preds, regression=True, return_as_tuple=True)
+            mae, mse, rmse, r2 = metrics_dict["mae"], metrics_dict["mse"], metrics_dict["rmse"], metrics_dict["r2"]
             print(f"{k} MAE:  {mae:.4f}")
             print(f"{k} MSE:  {mse:.4f}")
             print(f"{k} RMSE: {rmse:.4f}")
@@ -453,20 +558,8 @@ def evaluate_model(model,
             data_dict[f"r2_{k}"]   = [float(r2)]
 
         else:
-            if save_extra_info:
-                save_confusion_matrix(
-                    all_preds,
-                    all_labels,
-                    num_buckets,
-                    save_path,
-                    file_prefix,
-                    k
-                )
-            
-            iou, precision, recall, f1 = calculate_all_metrics(all_labels, 
-                                                            all_preds, 
-                                                            num_buckets=num_buckets,
-                                                            return_as_tuple=True)
+           
+            precision, recall, f1, iou = metrics_dict["pre"], metrics_dict["acc"], metrics_dict["f1"], metrics_dict["iou"]
 
             print(f"{k} Precision: {precision:.4f}")
             print(f"{k} Recall: {recall:.4f}")
@@ -478,15 +571,40 @@ def evaluate_model(model,
             data_dict[f"f1_{k}"] = [f1]
             data_dict[f"iou_{k}"] = [float(iou)]
 
+        if load_y_id:
+            #TODO efficient vectorized per-hedge metric calculation
+            pass
+
     # Save metrics to JSON
     with open(f"{save_path}/{file_prefix}_metrics.json", "w+") as outfile:
         json.dump(data_dict, outfile, indent=4)
     
-    if return_preds:
-        all_preds_np = all_preds.numpy().astype(np.int64).flatten()
-        all_labels_np = all_labels.numpy().astype(np.int64).flatten()
-        return all_preds_np, all_labels_np
     return data_dict
+
+
+def full_dataset_inference(model: torch.nn.Module,
+                         dataloader: torch.utils.data.DataLoader,
+                         device: str,
+                         regression:bool = False):
+    all_preds = []
+    if device is None:
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    with torch.no_grad():
+            for batch_idx, item in enumerate(dataloader):
+                _progress_bar(batch_idx + 1, len(dataloader), prefix=" Running inference over full dataset... ")
+                preds, _ = get_batch_predictions(
+                    model=model,
+                    item=item,
+                    device=device,
+                    load_y_id=False,
+                    y_transform=YTransform.NONE,
+                    regression=regression
+                )
+
+                all_preds.append(preds)
+        
+    stacked_preds = torch.cat(all_preds, dim=0)
+    return stacked_preds
 
 
 def evaluate_per_patch_performance(model, 

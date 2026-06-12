@@ -6,8 +6,6 @@ import itertools
 
 import torch
 
-from src.training.dataset_dataloader import HedgementationDataset
-
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -46,6 +44,7 @@ def load_norm_vals(file_path, num_channels, norm_dims=(0,1,3,4)):
             "data_path",
             load_func=lambda : DATASET_ROOT,
         )
+        from src.training.hedgementation_dataset import HedgementationDataset
         dataset = HedgementationDataset(train_metadata, data_path, constant_length=True)
         dataloader = torch.utils.data.DataLoader(dataset, batch_size=16)
 

@@ -1,6 +1,6 @@
 """
-Modified from https://github.com/TUM-LMF/MTLCC-pytorch/blob/master/src/models/convlstm/convlstm.py
-authors: TUM-LMF
+Taken from https://github.com/VSainteuf/utae-paps/blob/main/src/backbones/convgru.py
+authors: Vivien Sainte Fare Garnot and Loic Landrieu  
 """
 import torch.nn as nn
 from torch.autograd import Variable

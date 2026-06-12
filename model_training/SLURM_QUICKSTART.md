@@ -91,7 +91,22 @@ python scripts/submit_experiments.py --generate_only
 
 ## Local sanity check (no SLURM)
 
-`run_single_experiment.py` works without `submit_experiments.py`:
+Before submitting, validate the whole pipeline on your local machine with
+`--local_test`. It generates the configs and the SLURM script exactly as a real
+submission would, syntax-checks the script, then runs the same worker entrypoint
+the cluster runs (`run.py --slurm_worker`) with `--smoke_test` (1 epoch on a few
+datapoints, evals skipped). Requires `DATASET_ROOT` in `.env` to point at a local
+copy of the dataset.
+
+```bash
+# Sanity-check locally (same args you plan to submit with, plus --local_test)
+python scripts/submit_experiments.py --experiment_indices "0,2,5" --local_test
+
+# If it passes, submit for real
+python scripts/submit_experiments.py --experiment_indices "0,2,5"
+```
+
+Alternatively, `run_single_experiment.py` works without `submit_experiments.py`:
 
 ```bash
 python scripts/run_single_experiment.py \

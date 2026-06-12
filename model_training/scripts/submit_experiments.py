@@ -9,6 +9,7 @@ This script automates the process of:
 """
 
 import json
+import logging
 import os
 import shutil
 import subprocess
@@ -20,6 +21,7 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from src.logging_utils import setup_logging
 from src.training.experiment_configs import save_experiment_configs, get_experiment_configs
 from slurm_utils import (
     DEFAULT_DATA_ARCHIVE,
@@ -30,6 +32,9 @@ from slurm_utils import (
     python_env_block,
     submit_job,
 )
+
+setup_logging()
+logger = logging.getLogger(__name__)
 
 
 def parse_args():
@@ -114,6 +119,23 @@ def parse_args():
         default=None,
         help="Paths to JSON config files to run directly. Bypasses keyword-based config generation.",
     )
+    parser.add_argument(
+        "--exclude",
+        type=str,
+        default=None,
+        help="Comma-separated node list passed through to sbatch --exclude (e.g. 'fc10507,fc10509').",
+    )
+    parser.add_argument(
+        "--local_test",
+        action="store_true",
+        help=(
+            "Validate the pipeline locally instead of submitting: generates configs and the "
+            "SLURM script as usual, syntax-checks the script, then runs the same worker "
+            "entrypoint (run.py --slurm_worker) for each selected experiment with --smoke_test "
+            "(1 epoch, truncated dataset). Requires DATASET_ROOT in .env to point at a local "
+            "copy of the dataset. Re-run without this flag to submit."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -128,13 +150,20 @@ def create_slurm_script(
     source_dir: str,
     gpu_config: str = None,
     experiment_indices: str = None,
+    exclude: str = None,
     ssh_key: str = None,
     batch_size: int = 4,
     num_workers: int = None,
     data_archive: str = DEFAULT_DATA_ARCHIVE,
     metadata_copy_block: str = "",
+    experiments_dir: str = "experiments",
 ) -> str:
     """Create a customized SLURM script."""
+    if os.path.isabs(experiments_dir):
+        experiment_dir_line = f"EXPERIMENT_DIR={experiments_dir}"
+    else:
+        experiment_dir_line = f"EXPERIMENT_DIR=$SOURCEDIR/{experiments_dir}"
+
     if experiment_indices:
         array_spec = f"--array={experiment_indices}%{max_parallel}"
     else:
@@ -142,9 +171,13 @@ def create_slurm_script(
 
     effective_num_workers = num_workers if num_workers is not None else cpus_per_task
 
+    exclude_directive = f"#SBATCH --exclude={exclude}" if exclude else ""
+
     gpu_directives = ""
     gpu_info_comment = ""
     gpu_setup_code = ""
+    gpu_check_code = ""
+    gpu_flag_line = ""
     ssh_setup_code = ""
 
     if ssh_key:
@@ -183,6 +216,29 @@ echo "GPU Information:"
 nvidia-smi
 echo ""
 """
+        gpu_check_code = """
+# Verify torch can actually use the allocated GPU. nvidia-smi succeeding above
+# only proves the device was allocated; torch's CUDA init can still fail
+# (driver problem, broken module environment) and training would otherwise
+# silently fall back to CPU. A wedged driver can also make cuInit hang for
+# minutes, so the whole check runs under a timeout. Aborts the job on failure.
+echo "Verifying torch can initialize CUDA..."
+if ! timeout 300 python3 - <<'PYEOF'
+import os, sys, torch
+print("torch", torch.__version__, "| built for CUDA", torch.version.cuda)
+print("CUDA_VISIBLE_DEVICES =", os.environ.get("CUDA_VISIBLE_DEVICES"))
+if not torch.cuda.is_available():
+    print("ERROR: GPU was allocated but torch failed to initialize CUDA. "
+          "Aborting instead of training on CPU.", file=sys.stderr)
+    sys.exit(1)
+print("CUDA OK:", torch.cuda.get_device_name(0), "| archs:", torch.cuda.get_arch_list())
+PYEOF
+then
+    echo "ERROR: CUDA verification failed or timed out after 300s (wedged driver?) on $(hostname). Aborting." >&2
+    exit 1
+fi
+"""
+        gpu_flag_line = f" \\\n    --gpu {gpu_config}"
 
     script_content = f"""#!/bin/bash
 #SBATCH --account={account}
@@ -193,6 +249,7 @@ echo ""
 #SBATCH --output=logs/%x-%A_%a.out
 #SBATCH --error=logs/%x-%A_%a.err
 #SBATCH {array_spec}
+{exclude_directive}
 {gpu_directives}
 
 # Auto-generated SLURM submission script
@@ -209,7 +266,7 @@ source .env
 set +a
 
 # Expand any leading ~ in DATASET_ROOT (tilde is not expanded inside .env values)
-DATASET_ROOT="${{DATASET_ROOT/#\~/$HOME}}"
+DATASET_ROOT="${{DATASET_ROOT/#\\~/$HOME}}"
 
 echo "=========================================="
 echo "Starting Job Array Task ${{SLURM_ARRAY_TASK_ID}}"
@@ -220,7 +277,7 @@ echo "=========================================="
 {gpu_setup_code}
 # Define paths
 SOURCEDIR={source_dir}
-EXPERIMENT_DIR=$SOURCEDIR/experiments
+{experiment_dir_line}
 CONFIG_FILE=$EXPERIMENT_DIR/experiment_${{SLURM_ARRAY_TASK_ID}}_config.json
 EXPERIMENT_SUBDIR=$EXPERIMENT_DIR/experiment_${{SLURM_ARRAY_TASK_ID}}
 
@@ -233,7 +290,7 @@ fi
 echo "Experiment directory: $EXPERIMENT_SUBDIR"
 
 {python_env_block(source_dir, ssh_setup_code)}
-
+{gpu_check_code}
 # Setup data directories
 echo "Setting up data directories..."
 mkdir -p $SLURM_TMPDIR/data
@@ -260,7 +317,7 @@ python3 -u run.py \\
     --cache_dir "$SLURM_TMPDIR/cache" \\
     --cpus_per_task {cpus_per_task} \\
     --num_workers {effective_num_workers} \\
-    --batch_size {batch_size}
+    --batch_size {batch_size}{gpu_flag_line}
 
 
 TRAIN_EXIT_CODE=$?
@@ -320,15 +377,98 @@ echo "=========================================="
     return output_path
 
 
+def run_local_smoke_test(script_path, selected_indices, num_experiments, args):
+    """Sanity-check the pipeline locally before requesting a SLURM allocation.
+
+    Runs the exact command the SLURM script runs (run.py --slurm_worker) for each
+    selected experiment, with --smoke_test added and local paths substituted for
+    $SLURM_TMPDIR, so config loading, TrainerConfig construction, dataloaders and
+    one training epoch are all exercised.
+    """
+    import tempfile
+    from dotenv import load_dotenv
+
+    logger.info("=" * 40)
+    logger.info("LOCAL TEST MODE — nothing will be submitted")
+    logger.info("=" * 40)
+
+    logger.info(f"Checking bash syntax of {script_path}...")
+    syntax = subprocess.run(["bash", "-n", script_path], capture_output=True, text=True)
+    if syntax.returncode != 0:
+        logger.error(f"✗ Syntax error in generated SLURM script:\n{syntax.stderr}")
+        return 1
+    logger.info("✓ SLURM script syntax OK")
+
+    load_dotenv()
+    dataset_root = os.environ.get("DATASET_ROOT")
+    if dataset_root:
+        dataset_root = os.path.expanduser(dataset_root)
+    if not dataset_root or not os.path.isdir(dataset_root):
+        logger.error(f"✗ DATASET_ROOT ('{dataset_root}') is not a directory.")
+        logger.error("  Set it in .env to your local dataset root to run the local test.")
+        return 1
+
+    if selected_indices:
+        indices = [int(i) for i in selected_indices.split(",")]
+    else:
+        indices = list(range(num_experiments))
+    if len(indices) > 1:
+        logger.info(f"Testing {len(indices)} experiments. Narrow the set with "
+                    "--experiment_indices or --experiment_keywords if this is too slow.")
+
+    effective_num_workers = (
+        args.num_workers if args.num_workers is not None else args.cpus_per_task
+    )
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        models_dir = os.path.join(tmpdir, "models")
+        cache_dir = os.path.join(tmpdir, "cache")
+        os.makedirs(models_dir)
+
+        for idx in indices:
+            exp_dir = os.path.join(args.experiments_dir, f"experiment_{idx}")
+            cmd = [
+                sys.executable, "-u", "run.py",
+                "--slurm_worker",
+                "--smoke_test",
+                "--experiment_dir", exp_dir,
+                "--data_path", dataset_root,
+                "--output_dir", models_dir,
+                "--cache_dir", cache_dir,
+                "--cpus_per_task", str(args.cpus_per_task),
+                "--num_workers", str(effective_num_workers),
+                "--batch_size", str(args.batch_size),
+            ]
+            if args.gpu:
+                cmd += ["--gpu", args.gpu]
+            logger.info("-" * 40)
+            logger.info(f"Experiment {idx}: {' '.join(cmd)}")
+            logger.info("-" * 40)
+            result = subprocess.run(cmd)
+            if result.returncode != 0:
+                logger.error(f"✗ Local test failed for experiment {idx} "
+                             f"(exit code {result.returncode})")
+                return 1
+            logger.info(f"✓ Experiment {idx} passed")
+
+    resubmit_args = [a for a in sys.argv if a != "--local_test"]
+    logger.info("=" * 40)
+    logger.info("✓ All local smoke tests passed")
+    logger.info("=" * 40)
+    logger.info("Submit for real with:")
+    logger.info(f"  python {' '.join(resubmit_args)}")
+    return 0
+
+
 def main():
     """Main execution function."""
     args = parse_args()
 
-    print("========================================")
-    print("SLURM Array Job Submission Tool")
-    print("========================================")
+    logger.info("=" * 40)
+    logger.info("SLURM Array Job Submission Tool")
+    logger.info("=" * 40)
 
-    print("\nCreating directories...")
+    logger.info("Creating directories...")
     os.makedirs("logs", exist_ok=True)
     os.makedirs("results", exist_ok=True)
     os.makedirs(args.experiments_dir, exist_ok=True)
@@ -337,8 +477,11 @@ def main():
     # This runs on the login node (which has network access) so the compute nodes
     # can install from the local path without any outbound connections.
     utils_dir = Path("hedgementation_utils")
-    if not utils_dir.exists():
-        print("\nCloning hedgementation_utils (login node)...")
+    if args.local_test:
+        # Local test uses the venv-installed package; compute nodes need the clone.
+        logger.info("--local_test: skipping hedgementation_utils clone")
+    elif not utils_dir.exists():
+        logger.info("Cloning hedgementation_utils (login node)...")
         clone_env = os.environ.copy()
         if args.ssh_key:
             clone_env["GIT_SSH_COMMAND"] = (
@@ -349,12 +492,12 @@ def main():
             check=True,
             env=clone_env,
         )
-        print(f"Cloned to {utils_dir.resolve()}")
+        logger.info(f"Cloned to {utils_dir.resolve()}")
     else:
-        print(f"\nUsing existing hedgementation_utils at {utils_dir.resolve()}")
+        logger.info(f"Using existing hedgementation_utils at {utils_dir.resolve()}")
 
     if args.config_paths:
-        print(f"\nLoading {len(args.config_paths)} custom config(s) into '{args.experiments_dir}'...")
+        logger.info(f"Loading {len(args.config_paths)} custom config(s) into '{args.experiments_dir}'...")
         experiments = {}
         matching = {}
         for i, path in enumerate(args.config_paths):
@@ -372,19 +515,13 @@ def main():
             json.dump(matching, f, indent=4)
         num_experiments = len(args.config_paths)
     else:
-        print(f"\nGenerating experiment configurations in '{args.experiments_dir}'...")
+        logger.info(f"Generating experiment configurations in '{args.experiments_dir}'...")
         num_experiments = save_experiment_configs(args.experiments_dir)
         experiments = get_experiment_configs()
 
-    print(f"\nLoaded {num_experiments} experiments:")
+    logger.info(f"Loaded {num_experiments} experiments:")
     for idx, (config_keyword, exp) in enumerate(experiments.items()):
-        print(f"  [{idx}] {config_keyword}  ({exp.keyword})")
-
-    if args.generate_only:
-        print("\n--generate_only flag set. Skipping job submission.")
-        print(f"\nTo submit manually, run:")
-        print(f"  sbatch scripts/slurm_array_job_generated.sh")
-        return 0
+        logger.info(f"  [{idx}] {config_keyword}  ({exp.keyword})")
 
     # Resolve --experiment_keywords to a comma-separated index string (takes precedence over --experiment_indices)
     selected_indices = None
@@ -393,25 +530,25 @@ def main():
         resolved = []
         for kw in args.experiment_keywords:
             if kw not in keyword_to_idx:
-                print(f"ERROR: Unknown keyword '{kw}'. Available: {list(keyword_to_idx.keys())}")
+                logger.error(f"Unknown keyword '{kw}'. Available: {list(keyword_to_idx.keys())}")
                 return 1
             resolved.append(keyword_to_idx[kw])
         selected_indices = ",".join(str(i) for i in resolved)
-        print(f"\nRunning experiments by keyword: {' '.join(args.experiment_keywords)}")
+        logger.info(f"Running experiments by keyword: {' '.join(args.experiment_keywords)}")
     elif args.experiment_indices:
         parsed_indices = [int(i) for i in args.experiment_indices.split(",")]
         for idx in parsed_indices:
             if idx >= num_experiments:
-                print(f"ERROR: Experiment index {idx} out of range (0-{num_experiments-1})")
+                logger.error(f"Experiment index {idx} out of range (0-{num_experiments-1})")
                 return 1
         selected_indices = ",".join(str(i) for i in parsed_indices)
 
     if selected_indices:
-        print(f"\nRunning specific experiments: {selected_indices}")
+        logger.info(f"Running specific experiments: {selected_indices}")
     else:
-        print(f"\nRunning all {num_experiments} experiments")
+        logger.info(f"Running all {num_experiments} experiments")
 
-    print("\nCreating SLURM submission script...")
+    logger.info("Creating SLURM submission script...")
     script_path = create_slurm_script(
         num_experiments=num_experiments,
         max_parallel=args.max_parallel,
@@ -423,38 +560,51 @@ def main():
         source_dir=args.source_dir or os.getcwd(),
         gpu_config=args.gpu,
         experiment_indices=selected_indices,
+        exclude=args.exclude,
         ssh_key=args.ssh_key,
         num_workers=args.num_workers,
         batch_size=args.batch_size,
         data_archive=args.data_archive,
+        experiments_dir=args.experiments_dir,
     )
 
-    print(f"Created: {script_path}")
-    print(f"\nJob configuration:")
-    print(f"  Account: {args.account}")
-    print(f"  Time limit: {args.time}")
-    print(f"  Memory per CPU: {args.mem_per_cpu}")
-    print(f"  CPUs per task: {args.cpus_per_task}")
-    print(f"  Max parallel: {args.max_parallel}")
+    logger.info(f"Created: {script_path}")
+    logger.info("Job configuration:")
+    logger.info(f"  Account: {args.account}")
+    logger.info(f"  Time limit: {args.time}")
+    logger.info(f"  Memory per CPU: {args.mem_per_cpu}")
+    logger.info(f"  CPUs per task: {args.cpus_per_task}")
+    logger.info(f"  Max parallel: {args.max_parallel}")
     if args.gpu:
-        print(f"  GPU config: {args.gpu}  ({_GPU_SLURM_DIRECTIVES[args.gpu].lstrip('#SBATCH ')})")
+        logger.info(f"  GPU config: {args.gpu}  ({_GPU_SLURM_DIRECTIVES[args.gpu].lstrip('#SBATCH ')})")
+    if args.exclude:
+        logger.info(f"  Excluded nodes: {args.exclude}")
 
-    if args.dry_run:
-        print("\n--dry_run flag set. Would submit:")
-        print(f"  sbatch {script_path}")
+    if args.generate_only:
+        logger.info("--generate_only flag set. Skipping job submission.")
+        logger.info("To submit manually, run:")
+        logger.info(f"  sbatch {script_path}")
         return 0
 
-    print(f"\nSubmitting job array to SLURM...")
+    if args.local_test:
+        return run_local_smoke_test(script_path, selected_indices, num_experiments, args)
+
+    if args.dry_run:
+        logger.info("--dry_run flag set. Would submit:")
+        logger.info(f"  sbatch {script_path}")
+        return 0
+
+    logger.info("Submitting job array to SLURM...")
     job_id = submit_job(script_path)
     if job_id is None:
         return 1
 
-    print(f"\n✓ Successfully submitted job array: {job_id}")
-    print(f"\nMonitor jobs with:")
-    print(f"  squeue -u $USER")
-    print(f"  python scripts/monitor_jobs.py --job_id {job_id}")
-    print(f"\nView logs in: logs/")
-    print(f"View results in: results/")
+    logger.info(f"✓ Successfully submitted job array: {job_id}")
+    logger.info("Monitor jobs with:")
+    logger.info("  squeue -u $USER")
+    logger.info(f"  python scripts/monitor_jobs.py --job_id {job_id}")
+    logger.info("View logs in: logs/")
+    logger.info("View results in: results/")
     return 0
 
 

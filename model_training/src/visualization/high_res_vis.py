@@ -26,7 +26,7 @@ import torch
 
 from backbones.unet3d import UNet3D
 from backbones.utae import UTAE
-from src.training.dataset_dataloader import HedgementationDataset
+from src.training.hedgementation_dataset import HedgementationDataset
 from src.training.transforms import Normalization, YTransform, compound_transform
 load_dotenv()
 

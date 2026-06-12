@@ -4,11 +4,18 @@ from typing import Optional
 import torch
 import pathlib
 import pandas as pd
+import geopandas as gpd
+from torchvision.transforms import v2
 import os
 import numpy as np
-import pickle
 from dotenv import load_dotenv
 from hedgementation_utils.io.io_manager import HedgementationIOManager
+
+
+from functools import partial
+from src.training.transforms import AUGMENTATION_TRANSFORMS, YTransform, compound_transform
+
+from src.training.trainer_config import TrainerConfig
 
 load_dotenv()
 
@@ -19,15 +26,15 @@ RPG_MASK_SUBDIR = os.environ["RPG_MASK_SUBDIR"]
 
 class HedgementationDataset(torch.utils.data.Dataset):
     def __init__(self,
-                 metadata_frame,
-                 root_dir=DATASET_ROOT,
-                 rpg_mask_subdir=RPG_MASK_SUBDIR,
-                 constant_length=None,
-                 use_memmap=False,
+                 metadata_frame: gpd.GeoDataFrame,
+                 root_dir:str=DATASET_ROOT,
+                 rpg_mask_subdir:str=RPG_MASK_SUBDIR,
+                 constant_length:Optional[int]=None,
+                 use_memmap:bool=False,
                  transform=None,
-                 provide_agriculture_masks=False,
+                 provide_rpg_masks=False,
                  downsample_loss=False,
-                 downsample_mask_path=None,
+                 downsample_mask_dir=None,
                  reference_date="2021-09-17",
                  cache_dir=None,
                  transform_vals = None,
@@ -48,16 +55,17 @@ class HedgementationDataset(torch.utils.data.Dataset):
         self.constant_length = constant_length
         self.target_size = target_size
         self.even_sample = even_sample
-        self.provide_agriculture_masks = provide_agriculture_masks
+        self.provide_rpg_masks = provide_rpg_masks
         self.downsample_loss = downsample_loss
-        self.downsample_mask_path = downsample_mask_path
+        self.downsample_mask_path = downsample_mask_dir
         self.load_X_cloud = load_X_cloud
         self.load_y_id = load_y_id
         self.cloud_threshold = cloud_threshold
         self.cloud_band = cloud_band
         self.transfer = transfer
+        self.length = len(self.metadata_frame)
 
-        if rpg_mask_subdir is None and self.provide_agriculture_masks:
+        if rpg_mask_subdir is None and self.provide_rpg_masks:
             rpg_mask_subdir = RPG_MASK_SUBDIR
         self.rpg_mask_subdir = rpg_mask_subdir
 
@@ -73,14 +81,64 @@ class HedgementationDataset(torch.utils.data.Dataset):
             **(io_manager_kwargs or {}),
         )
 
+        self.patch_ids = self.metadata_frame["ID_PATCH"].tolist()
+
         self.reference_date = datetime.datetime(*map(int, reference_date.split("-")))
         if self.use_memmap:
             self._build_memmap()
 
-        if self.provide_agriculture_masks:
+        if self.provide_rpg_masks:
             self._load_masks()
         if self.downsample_loss:
             self._load_downsample_masks()
+        if self.load_y_id:
+            self._load_y_ids()
+
+    @classmethod 
+    def create_augmentation_func(cls, augmentation: Optional[list[str]]):
+        """Create augmentation function from config."""
+        if not augmentation:
+            return None
+
+        transforms = [
+            AUGMENTATION_TRANSFORMS[aug] for aug in augmentation
+        ]
+        return v2.Compose(transforms) if len(transforms) > 1 else transforms[0]
+    @classmethod
+    def _from_config(cls,
+                     config: TrainerConfig,
+                     split: str = "train"):
+        
+        is_train = ("train" in split)
+        augmentation_func = cls.create_augmentation_func(config.augmentation)
+        return HedgementationDataset(
+            metadata_frame=config.metadata_frames[split],
+            root_dir=config.dataset_root,
+            rpg_mask_subdir=config.rpg_mask_subdir,
+            constant_length=config.image_count,
+            provide_rpg_masks=config.provide_rpg_masks,
+            transform=partial(
+                compound_transform,
+                num_buckets=config.num_buckets,
+                normalization=config.normalization,
+                y_transform=(
+                    config.y_transform if not config.inclusion_intervals else YTransform.NONE
+                ),
+                augmentation=(augmentation_func if is_train else None),
+                y_threshold=config.y_threshold,
+            ),
+            downsample_loss=config.downsample_loss,
+            downsample_mask_dir=config.downsample_mask_dir,
+            reference_date=config.reference_date,
+            cache_dir = config.cache_dir,
+            target_size=config.target_size,
+            load_X_cloud=config.load_X_cloud,
+            load_y_id=config.load_y_id,
+            cloud_band=config.cloud_band,
+            cloud_threshold=config.cloud_threshold,
+            io_manager_kwargs=config.io_manager_kwargs,
+            transfer=config.transfer
+        )
 
     def _get_cache_path(self, identifier):
         key = str(identifier)
@@ -101,9 +159,8 @@ class HedgementationDataset(torch.utils.data.Dataset):
                     if self.load_X_cloud:
                         return X, data["X_cloud"].copy(), dates, y
                     return X, dates, y
-            except Exception:
-                pass
-
+            except Exception as e:
+                print(f"Cache read failed for {cache_path}: {e}")
         if not self.load_X_cloud:
             X, raw_dates = self.io_manager.load_X(identifier=identifier, return_dates=True)
         else:
@@ -173,11 +230,22 @@ class HedgementationDataset(torch.utils.data.Dataset):
 
         print(f"Loaded {len(self.downsample_masks)} downsample masks")
 
+    def _load_y_ids(self):
+        """Pre-load all y_id arrays into memory."""
+        print("Loading y_id arrays...")
+        self.y_ids = {}
+        for current_id in self.patch_ids:
+            self.y_ids[current_id] = torch.from_numpy(
+                self.io_manager.load_y_id(identifier=current_id).astype(np.int64)
+            )
+        print(f"Loaded {len(self.y_ids)} y_id arrays")
+
     def __len__(self):
-        return len(self.metadata_frame)
+        return self.length
+    
     
     def __getitem__(self, idx):
-        current_id = self.metadata_frame["ID_PATCH"].iloc[idx]
+        current_id = self.patch_ids[idx]
         if not self.load_X_cloud:
             X, dates, y = self._load_raw_cached(current_id)
         else:
@@ -188,7 +256,7 @@ class HedgementationDataset(torch.utils.data.Dataset):
             
         if self.constant_length and X.shape[0] > self.constant_length:
             if self.even_sample:
-                indices = np.linspace(0, X.shape[0] - 1, self.constant_length, dtype=np.int64)
+                indices = np.linspace(0, X.shape[0] - 1, self.constant_length, dtype=np.int16)
                 X = X[indices, :, :, :]
                 dates = dates[indices]
                 if self.load_X_cloud:
@@ -201,13 +269,12 @@ class HedgementationDataset(torch.utils.data.Dataset):
 
         # Build masks dict for any masks that are needed
         masks_in = {}
-        if self.provide_agriculture_masks:
+        if self.provide_rpg_masks:
             masks_in["ag"] = self.agriculture_masks[current_id]
         if self.downsample_loss:
             masks_in["ds"] = self.downsample_masks[current_id]
         if self.load_y_id:
-            y_id = self.io_manager.load_y_id(identifier=current_id)
-            masks_in["y_id"] = torch.from_numpy(y_id.astype(np.int64))
+            masks_in["y_id"] = self.y_ids[current_id]
         if self.transfer is not None and self.transfer.get("transfer"):
             patch_idx = self.transfer["params"]["patch_ids"].get(int(current_id))
             if patch_idx is not None:
@@ -246,177 +313,4 @@ class HedgementationDataset(torch.utils.data.Dataset):
 
 
 
-    
-
-
-def setup_dataloader(
-    metadata_frame,
-    data_path,
-    image_count,
-    num_buckets,
-    normalization,
-    y_transform,
-    inclusion_intervals,
-    batch_size,
-    augmentation_func=None,
-    use_memmap=False,
-    y_threshold=None,
-    shuffle=True,
-    is_train=False,
-    provide_agriculture_masks=False,
-    agriculture_mask_path=None,
-    downsample_loss=False,
-    downsample_mask_path=None,
-    load_X_cloud=False,
-    load_y_id=False,
-    cloud_threshold=None,
-    cloud_band=0,
-    cache_dir=None,
-    io_manager_kwargs=None,
-    transfer=None,
-    num_workers=8,
-):
-    """
-    Create a single dataloader for a given phase.
-
-    Args:
-        metadata_frame: Metadata DataFrame for this phase
-        data_path: Root directory of the dataset
-        image_count: Number of images per sample
-        num_buckets: Number of classification buckets
-        normalization: Normalization strategy
-        y_transform: Target transform strategy
-        inclusion_intervals: Optional intervals for included loss
-        augmentation_func: Augmentation function to apply (only used if is_train=True)
-        y_threshold: Optional threshold for target values
-        use_memmap: Whether to use memory-mapped files
-        batch_size: Batch size for the dataloader
-        is_train: Whether this dataloader is for the training phase
-
-    Returns:
-        DataLoader: A configured DataLoader instance
-    """
-    from functools import partial
-    from torch.utils.data import DataLoader
-    from src.training.train_utils import collate_fn
-    from src.training.transforms import YTransform, compound_transform
-
-    return DataLoader(
-        HedgementationDataset(
-            metadata_frame=metadata_frame,
-            root_dir=data_path,
-            constant_length=image_count,
-            use_memmap=use_memmap,
-            transform=partial(
-                compound_transform,
-                num_buckets=num_buckets,
-                normalization=normalization,
-                y_transform=(
-                    y_transform if not inclusion_intervals else YTransform.NONE
-                ),
-                augmentation=(augmentation_func if is_train else None),
-                y_threshold=y_threshold,
-            ),
-            provide_agriculture_masks=provide_agriculture_masks,
-            rpg_mask_subdir=agriculture_mask_path,
-            downsample_loss=downsample_loss,
-            downsample_mask_path=downsample_mask_path,
-            load_X_cloud=load_X_cloud,
-            load_y_id=load_y_id,
-            cloud_threshold=cloud_threshold,
-            cloud_band=cloud_band,
-            cache_dir=cache_dir,
-            io_manager_kwargs=io_manager_kwargs,
-            transfer=transfer
-        ),
-        batch_size=batch_size,
-        shuffle=shuffle,
-        num_workers=num_workers,
-        collate_fn=collate_fn,
-    )
-
-
-def setup_dataloaders(
-    metadata_frames,
-    data_path,
-    image_count,
-    num_buckets,
-    normalization,
-    y_transform,
-    inclusion_intervals,
-    augmentation_func,
-    y_threshold,
-    use_memmap,
-    batch_size,
-    provide_agriculture_masks,
-    agriculture_mask_path,
-    downsample_loss=False,
-    downsample_mask_path=None,
-    load_X_cloud=False,
-    load_y_id=False,
-    cloud_threshold=None,
-    cloud_band=0,
-    cache_dir=None,
-    io_manager_kwargs=None,
-    transfer=None,
-    num_workers=8,
-):
-    """
-    Create dataloaders for training, validation, and test sets.
-
-    Args:
-        metadata_frames: Dictionary mapping phase names to metadata DataFrames
-        data_path: Root directory of the dataset
-        image_count: Number of images per sample
-        num_buckets: Number of classification buckets
-        normalization: Normalization strategy
-        y_transform: Target transform strategy
-        inclusion_intervals: Optional intervals for included loss
-        augmentation_func: Augmentation function to apply
-        y_threshold: Optional threshold for target values
-        use_memmap: Whether to use memory-mapped files
-        batch_size: Batch size for dataloaders
-
-    Returns:
-        dict: Dictionary mapping phase names to DataLoaders
-    """
-    if transfer is not None and transfer.get("transfer"):
-        ids_path = transfer["params"]["ids_path"]
-        f0_path = transfer["params"]["f0_path"]
-        f0_weights = torch.load(f0_path)[:, 1, :, :]
-        val_max = transfer["params"]["clipping"]
-        f0_weights = torch.clamp(f0_weights, max=val_max)
-        patch_ids = torch.load(ids_path)
-        patch_ids_dict = {int(pid): i for i, pid in enumerate(patch_ids)}
-        transfer["params"]["patch_ids"] = patch_ids_dict
-        transfer["params"]["f0_weights"] = f0_weights
-
-    return {
-        phase: setup_dataloader(
-            metadata_frame=metadata_frames[phase],
-            data_path=data_path,
-            image_count=image_count,
-            num_buckets=num_buckets,
-            normalization=normalization,
-            y_transform=y_transform,
-            inclusion_intervals=inclusion_intervals,
-            augmentation_func=augmentation_func,
-            y_threshold=y_threshold,
-            use_memmap=use_memmap,
-            batch_size=batch_size,
-            is_train=(phase == "train"),
-            provide_agriculture_masks=provide_agriculture_masks,
-            agriculture_mask_path=agriculture_mask_path,
-            downsample_loss=downsample_loss,
-            downsample_mask_path=downsample_mask_path,
-            load_X_cloud=load_X_cloud,
-            load_y_id=load_y_id,
-            cloud_threshold=cloud_threshold,
-            cloud_band=cloud_band,
-            cache_dir=cache_dir,
-            io_manager_kwargs=io_manager_kwargs,
-            transfer=transfer,
-            num_workers=num_workers,
-        )
-        for phase in metadata_frames
-    }
+  

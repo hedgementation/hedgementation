@@ -7,7 +7,7 @@ Called by scripts/submit_experiments.py via the SLURM array job. Each array
 task receives:
   --config_file      Path to JSON config produced by save_experiment_configs()
   --metadata_dir     Directory containing per-split metadata CSVs
-  --data_path        Override for TrainerConfig.data_path
+  --data_path        Override for TrainerConfig.dataset_root
   --save_path        Override for TrainerConfig.save_path
   --cache_dir        Override for TrainerConfig.cache_dir
   --config_overrides JSON object of additional TrainerConfig field overrides
@@ -93,7 +93,7 @@ def build_trainer_config(
     if metadata_frames is not None:
         runtime_overrides["metadata_frames"] = metadata_frames
     if data_path:
-        runtime_overrides["data_path"] = data_path
+        runtime_overrides["dataset_root"] = data_path
     if save_path:
         runtime_overrides["save_path"] = save_path
     if cache_dir:
@@ -163,7 +163,7 @@ def run_single_experiment(
     print("\n" + "=" * 40)
     print("Training Completed Successfully")
     print("=" * 40)
-    print(f"Best validation IoU: {trainer.metrics.best_iou:.4f}")
+    print(f"Best validation IoU: {trainer.metrics.best_metric:.4f}")
     print(f"Best epoch: {trainer.metrics.best_epoch}")
     return 0
 
@@ -177,7 +177,7 @@ def parse_args():
     parser.add_argument("--predefined_keyword", type=str, default=None,
                         help="Keyword from TrainerConfig.predefined_config_keywords")
     parser.add_argument("--data_path", type=str, default=None,
-                        help="Override TrainerConfig.data_path")
+                        help="Override TrainerConfig.dataset_root")
     parser.add_argument("--save_path", type=str, default=None,
                         help="Override TrainerConfig.save_path")
     parser.add_argument("--metadata_dir", type=str, default=None,

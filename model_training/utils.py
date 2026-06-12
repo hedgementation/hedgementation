@@ -52,6 +52,11 @@ def load_experiments(root_dir):
         else:
             print(f"Warning: No file {config_file}")
 
+        # Migrate configs generated before data_path was renamed to dataset_root
+        if "data_path" in config_dict:
+            config_dict["dataset_root"] = config_dict.pop("data_path")
+            print(f"Note: migrated legacy 'data_path' key to 'dataset_root' in {config_file}")
+
         if config_dict.get("class_weights") == "autocalculated":
             config_dict["class_weights"] = None
         if config_dict.get("transfer"):
@@ -126,6 +131,7 @@ def train(
     cache_dir=None,
     num_workers=None,
     batch_size=None,
+    smoke_test=False,
 ):
     matching_file = os.path.join(experiments_dir, matching_path)
     try:
@@ -158,7 +164,7 @@ def train(
             cfg["save_results"] = False
 
         if data_path is not None:
-            cfg["data_path"] = data_path
+            cfg["dataset_root"] = data_path
 
         if cache_dir is not None:
             cfg["cache_dir"] = cache_dir
@@ -168,6 +174,14 @@ def train(
 
         if batch_size is not None:
             cfg["batch_size"] = batch_size
+
+        if smoke_test:
+            print("Smoke test: 1 epoch, truncated dataset, evals skipped")
+            cfg["num_epochs"] = 1
+            cfg["datapoint_limit"] = 2 * (batch_size or cfg.get("batch_size", 4))
+            cfg["skip_untrained_eval"] = True
+            cfg["skip_final_eval"] = True
+            cfg["skip_full_dataset_inference"] = True
 
         result = run_single_experiment(cfg)
         if result != 0:
@@ -181,7 +195,12 @@ def run_single_experiment(config_dict):
         trainer_config = TrainerConfig(**config_dict)
         trainer = Trainer(trainer_config)
         trainer.setup()
-        model, metrics = trainer.train(save_results=config_dict["save_results"])
+        trainer.train(
+            save_results=config_dict["save_results"],
+            skip_untrained_eval=trainer_config.skip_untrained_eval,
+            skip_final_eval=trainer_config.skip_final_eval,
+            skip_full_dataset_inference=trainer_config.skip_full_dataset_inference,
+        )
         print("✓ Training Completed Successfully")
         print(f"Best validation {config_dict['validation_metric']}: {trainer.metrics.best_metric:.4f}")
         print(f"Best epoch: {trainer.metrics.best_epoch}")

@@ -1,3 +1,8 @@
+"""
+Taken from https://github.com/VSainteuf/utae-paps/blob/main/src/backbones/ltae.py
+authors: Vivien Sainte Fare Garnot and Loic Landrieu  
+"""
+
 import copy
 
 import numpy as np

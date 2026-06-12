@@ -4,9 +4,11 @@ Main Trainer class for model training.
 This module provides the Trainer class, which orchestrates the complete training
 lifecycle including setup, training loop, evaluation, and results persistence.
 """
-
+import copy
 import json
+import logging
 import os
+import pathlib
 import random
 import shutil
 import time
@@ -25,22 +27,29 @@ from src.training.train_utils import LRSchedule
 from src.performance_analysis.evaluate_model import (
     evaluate_model,
     evaluate_per_patch_performance,
+    full_dataset_inference,
     visualize_model_predictions,
 )
 from src.performance_analysis.reg_meter import RegMeter, higher_is_better
 from hedgementation_utils.metrics.seg_meter import SegMeter
 from src.training.checkpointer import Checkpointer
 from src.training.datastore_utils import DataStore
-from src.training.dataset_dataloader import setup_dataloaders
+from src.training.dataloader_utils import dataloaders_from_config
 from src.training.early_stopping import EarlyStopping
 from src.training.metrics_tracker import MetricsTracker
 from src.training.train_utils import LRSchedulerFactory, ModelFactory, adapt_state_dict, calculate_class_weights, calculate_excluded_loss
 from src.training.trainer_config import TrainerConfig
-from hedgementation_utils.training.metadata_library import MetadataLibrary
+from hedgementation_utils.training.metadata_library import MetadataLibrary, SizeGroup
 from src.training.transforms import AUGMENTATION_TRANSFORMS, YTransform, transform_y
 
 
+from src.logging_utils import setup_logging
+
 load_dotenv()
+
+setup_logging()
+logger = logging.getLogger(__name__)
+
 NUM_CHANNELS = int(os.environ["NUM_CHANNELS"])
 DATASET_ROOT = os.environ["DATASET_ROOT"]
 
@@ -112,6 +121,7 @@ class Trainer:
         5. Configures loss function
         6. Initializes early stopping
         """
+        logger.info("Setting up trainer...")
         self._set_random_seeds()
         self._setup_device()
         self._setup_model()
@@ -120,11 +130,14 @@ class Trainer:
         self._setup_loss_function()
         self._setup_early_stopping()
         self._setup_evaluation()
+        logging.basicConfig(level=logging.INFO)
+        logger.info("Trainer setup complete.")
 
     def train(self,
-              save_results: bool = None,
-              skip_untrained_eval: bool = False,
-              skip_per_patch_eval: bool = False) -> Tuple[torch.nn.Module, dict]:
+              save_results: bool = True,
+              skip_untrained_eval: bool = True,
+              skip_final_eval: bool = True,
+              skip_full_dataset_inference: bool = True) -> Tuple[torch.nn.Module, dict]:
         """
         Execute the complete training process.
 
@@ -163,35 +176,41 @@ class Trainer:
 
                 # Evaluate untrained model
                 if not skip_untrained_eval:
+                    logger.info("Evaluating untrained model...")
                     self._evaluate_untrained(tempdir)
 
                 # Main training loop
+                logger.info(f"Starting training loop ({self.config.num_epochs} epochs)...")
                 start_time = time.time()
                 self._run_training_loop()
                 self._print_training_summary(time.time() - start_time)
 
                 # Save metrics and graphs
+                logger.info("Saving training artifacts...")
                 self._save_training_artifacts(tempdir)
 
                 # Evaluate final and best models
-                best_model_eval = self._evaluate_final_and_best(tempdir)
+                if not skip_final_eval:
+                    best_model_eval = self._evaluate_final_and_best(tempdir)
 
                 # Evaluate per-patch performance
-                if not skip_per_patch_eval:
-                    self._evaluate_per_patch_performance(tempdir)
+                if not skip_full_dataset_inference:
+                    logger.info("Recording results of inference on full dataset...")
+                    self._perform_inference_for_full_dataset(tempdir)
 
                 # Conditionally move to permanent storage
                 if save_results:
                     self._persist_results(tempdir)
             except Exception as e:
-                print(f"Training interrupted by exception {e}")
+                logger.exception(f"Training interrupted by exception: {e}")
                 if save_results:
-                    print("Saving existing results...")
+                    logger.info("Saving existing results...")
                     self._persist_results(tempdir)
                 raise e
 
-
-        return self.model, best_model_eval
+        if not skip_final_eval:
+            return self.model, best_model_eval
+        return self.model
 
     # ========== Private Setup Methods ==========
 
@@ -205,27 +224,50 @@ class Trainer:
         torch.manual_seed(seed)
         np.random.seed(seed)
         random.seed(seed)
+        logger.info(f"Random seed set to {seed}")
 
     def _setup_device(self):
         """Configure training device."""
         if self.config.device is None:
+            if not torch.cuda.is_available() and self._gpu_was_allocated():
+                raise RuntimeError(
+                    "A GPU was allocated to this job (CUDA_VISIBLE_DEVICES/SLURM_GPUS "
+                    "is set) but torch cannot initialize CUDA — refusing to fall back "
+                    "to CPU silently. Check the stderr log for the CUDA init error. "
+                    "Pass device='cpu' explicitly to train on CPU anyway."
+                )
             self.device = "cuda" if torch.cuda.is_available() else "cpu"
         else:
             self.device = self.config.device
-        print(f"Using {self.device} device")
+        logger.info(f"Using {self.device} device")
+        if torch.cuda.is_available() and self.device != "cpu":
+            logger.info(f"CUDA device: {torch.cuda.get_device_name(0)}")
+            logger.info(
+                f"torch {torch.__version__} (CUDA {torch.version.cuda}), "
+                f"supported archs: {torch.cuda.get_arch_list()}"
+            )
 
-    
+    @staticmethod
+    def _gpu_was_allocated() -> bool:
+        """Whether the scheduler granted this job a GPU (regardless of whether CUDA works)."""
+        return any(
+            os.environ.get(var)
+            for var in ("CUDA_VISIBLE_DEVICES", "SLURM_GPUS", "SLURM_JOB_GPUS", "SLURM_GPUS_ON_NODE")
+        )
+
+
     def _load_from_checkpoint(self,
                             model: torch.nn.Module,
                             checkpoint_path: str):
         state_dict = torch.load(checkpoint_path, weights_only=True)
         state_dict = adapt_state_dict(model, state_dict)
         if len(state_dict) == 0:
-            print(f"WARNING: No overlapping keys found for checkpoint at {checkpoint_path}")
+            logger.warning(f"No overlapping keys found for checkpoint at {checkpoint_path}")
         model.load_state_dict(state_dict)
 
     def _setup_model(self):
         """Initialize and configure the model."""
+        logger.info(f"Constructing model: backbone={self.config.backbone}, num_channels={NUM_CHANNELS}, num_buckets={self.config.num_buckets}")
         self.model = ModelFactory.construct_model(
             backbone=self.config.backbone,
             num_channels=NUM_CHANNELS,
@@ -234,20 +276,27 @@ class Trainer:
         )
 
         if self.config.checkpoint_path:
+            logger.info(f"Loading weights from checkpoint: {self.config.checkpoint_path}")
             self._load_from_checkpoint(
                 model=self.model,
                 checkpoint_path=self.config.checkpoint_path
             )
 
         if self.config.trainable_params is not None:
-            for (name,param) in self.model.named_parameters():
+            frozen = [name for name, _ in self.model.named_parameters() if name not in self.config.trainable_params]
+            for (name, param) in self.model.named_parameters():
                 if name not in self.config.trainable_params:
                     param.requires_grad = False
+            logger.info(f"Froze {len(frozen)} parameter groups; training only: {self.config.trainable_params}")
 
+        total_params = sum(p.numel() for p in self.model.parameters())
+        trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        logger.info(f"Model parameters: {trainable_params:,} trainable / {total_params:,} total")
         self.model = self.model.to(self.device)
 
     def _setup_dataloaders(self):
         """Create training and validation dataloaders."""
+        logger.info("Setting up dataloaders...")
         if not self.config.metadata_frames:
             metadata = gpd.read_file(f"{DATASET_ROOT}/metadata.geojson")
             self.config.metadata_frames = {
@@ -255,88 +304,50 @@ class Trainer:
                 "train": metadata[metadata["fold"].isin(TRAIN_FOLDS)],
             }
 
+        for split, frame in self.config.metadata_frames.items():
+            logger.info(f"  {split}: {len(frame)} samples")
+
         # Store train metadata in DataStore
         DataStore.set_data("train_metadata", self.config.metadata_frames["train"])
-        DataStore.set_data("data_path", self.config.data_path)
+        DataStore.set_data("data_path", self.config.dataset_root)
 
         # Setup augmentation
-        augmentation_func = self._create_augmentation_func()
 
         # Create dataloaders
-        self.dataloaders = setup_dataloaders(
-            metadata_frames=self.config.metadata_frames,
-            data_path=self.config.data_path,
-            image_count=self.config.image_count,
-            num_buckets=self.config.num_buckets,
-            inclusion_intervals=self.config.inclusion_intervals,
-            normalization=self.config.normalization,
-            y_threshold=self.config.y_threshold,
-            y_transform=self.config.y_transform,
-            augmentation_func=augmentation_func,
-            batch_size=self.config.batch_size,
-            use_memmap=self.config.use_memmap,
-            provide_agriculture_masks=self.config.provide_agriculture_mask,
-            agriculture_mask_path=self.config.agriculture_mask_path,
-            downsample_loss=self.config.downsample_loss,
-            downsample_mask_path=self.config.downsample_mask_path,
-            load_X_cloud=self.config.load_X_cloud,
-            load_y_id=self.config.load_y_id,
-            cloud_threshold=self.config.cloud_threshold,
-            cloud_band=self.config.cloud_band,
-            cache_dir=self.config.cache_dir,
-            io_manager_kwargs=self.config.io_manager_kwargs,
-            transfer=self.config.transfer,
-            num_workers=self.config.num_workers,
+        self.dataloaders = dataloaders_from_config(
+            config=self.config,
+            shuffle=True
         )
 
-        # Setup evaluation dataloaders (without inclusion_intervals)
-        if self.config.inclusion_intervals:
-            metadata = gpd.read_file(f"{DATASET_ROOT}/metadata.geojson")
-            self.eval_dataloaders = setup_dataloaders(
-                metadata_frames=self.config.metadata_frames,
-                data_path=self.config.data_path,
-                image_count=self.config.image_count,
-                num_buckets=self.config.num_buckets,
-                inclusion_intervals=None,
-                normalization=self.config.normalization,
-                y_threshold=self.config.y_threshold,
-                y_transform=self.config.y_transform,
-                batch_size=self.config.batch_size,
-                use_memmap=self.config.use_memmap,
-                provide_agriculture_masks=self.config.provide_agriculture_mask,
-                agriculture_mask_path=self.config.agriculture_mask_path,
-                downsample_loss=self.config.downsample_loss,
-                downsample_mask_path=self.config.downsample_mask_path,
-                load_X_cloud=self.config.load_X_cloud,
-                load_y_id=self.config.load_y_id,
-                cloud_threshold=self.config.cloud_threshold,
-                cloud_band=self.config.cloud_band,
-                cache_dir=self.config.cache_dir,
-                io_manager_kwargs=self.config.io_manager_kwargs,
-                num_workers=self.config.num_workers,
-                transfer=self.config.transfer,
+        # Setup evaluation dataloaders (without inclusion_intervals, and with the
+        # eval batch size — eval runs under no_grad, so it can afford much larger
+        # batches than training)
+        eval_batch_size = self.config.eval_batch_size or self.config.batch_size
+        if self.config.inclusion_intervals or eval_batch_size != self.config.batch_size:
+            if self.config.inclusion_intervals:
+                logger.info("inclusion_intervals set — creating separate eval dataloaders without interval filtering")
+            logger.info(f"Eval dataloaders use batch_size={eval_batch_size}")
+            config_cpy = copy.deepcopy(self.config)
+            config_cpy.inclusion_intervals = None
+            config_cpy.batch_size = eval_batch_size
+            self.eval_dataloaders = dataloaders_from_config(
+                config=config_cpy,
+                shuffle=True
             )
         else:
             self.eval_dataloaders = self.dataloaders
 
-    def _create_augmentation_func(self):
-        """Create augmentation function from config."""
-        if not self.config.augmentation:
-            return None
-
-        transforms = [
-            AUGMENTATION_TRANSFORMS[aug] for aug in self.config.augmentation
-        ]
-        return v2.Compose(transforms) if len(transforms) > 1 else transforms[0]
-
+    
     def _setup_optimizer_and_scheduler(self):
         """Initialize optimizer and learning rate scheduler."""
+        logger.info(f"Optimizer: AdamW (lr={self.config.lr}, weight_decay={self.config.weight_decay})")
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(),
             lr=self.config.lr,
             weight_decay=self.config.weight_decay,
         )
 
+        logger.info(f"LR scheduler: {self.config.lr_scheduler} (args={self.config.lr_scheduler_args})")
         self.scheduler = LRSchedulerFactory.construct_lr_scheduler(
             optimizer=self.optimizer,
             scheduler_type=self.config.lr_scheduler,
@@ -345,10 +356,10 @@ class Trainer:
 
     def _setup_loss_function(self):
         """Configure the loss function."""
-        
+        logger.info(f"Loss function: {self.config.loss_function.__name__}, class_weighted={self.config.class_weighted}")
         needs_pixel_loss = (
             self.config.inclusion_intervals is not None
-            or self.config.provide_agriculture_mask
+            or self.config.provide_rpg_masks
             or self.config.downsample_loss
             or (self.config.transfer is not None and self.config.transfer.get("transfer"))
         )
@@ -358,6 +369,7 @@ class Trainer:
 
         if self.config.class_weighted:
             if not self.config.class_weights:
+                logger.info("Computing class weights from training data...")
                 class_weights = calculate_class_weights(
                     self.dataloaders["train"],
                     num_classes=self.config.num_buckets + 1,
@@ -365,6 +377,7 @@ class Trainer:
                 )
             else:
                 class_weights = self.config.class_weights
+                logger.info(f"Using provided class weights: {class_weights}")
 
             reduction = "none" if needs_pixel_loss else "mean"
             self.criterion = self.config.loss_function(
@@ -378,6 +391,7 @@ class Trainer:
 
     def _setup_early_stopping(self):
         """Initialize early stopping."""
+        logger.info(f"Early stopping: patience={self.config.early_stopping_patience}, min_delta={self.config.early_stopping_min_delta}")
         self.early_stopping = EarlyStopping(
             patience=self.config.early_stopping_patience,
             min_delta=self.config.early_stopping_min_delta,
@@ -408,8 +422,8 @@ class Trainer:
     def _run_training_loop(self):
         """Execute the main training loop."""
         for epoch in range(self.config.num_epochs):
-            print(f"Epoch {epoch}/{self.config.num_epochs - 1}")
-            print("-" * 10)
+            logger.info(f"Epoch {epoch}/{self.config.num_epochs - 1}")
+            logger.info("-" * 10)
 
             # Train and validate
             for phase in ["train", "valid"]:
@@ -429,7 +443,7 @@ class Trainer:
 
             # Check early stopping
             if self.early_stopping.early_stop:
-                print("Stopping early due to EarlyStopping count exceeding patience")
+                logger.info("Stopping early due to EarlyStopping count exceeding patience")
                 break
 
     def _run_epoch(self, phase: str) -> Tuple[float, float]:
@@ -446,7 +460,8 @@ class Trainer:
 
         running_loss = 0.0
         batch_count = 0
-        batch_metrics = []
+
+        epoch_meter = self._make_meter()
 
         for batch_idx, item in enumerate(self.dataloaders[phase]):
             batch_count += 1
@@ -455,15 +470,13 @@ class Trainer:
             running_loss += loss
             
             if self.config.validation_metric != "loss":
-                batch_meter = self._make_meter()
                 if self.config.regression:
-                    batch_meter.update(preds, labels)
+                    epoch_meter.update(preds,labels)
                 else:
-                    batch_meter.update_batch(preds, labels)
-                batch_metrics.append(batch_meter.ask_metrics()[self.config.validation_metric])
+                    epoch_meter.update_batch(preds,labels)
 
             if batch_idx % 10 == 0:
-                print(
+                logger.info(
                     f"  Batch {batch_idx}/{len(self.dataloaders[phase])-1}, "
                     f"Loss: {loss:.4f}"
                 )
@@ -472,9 +485,9 @@ class Trainer:
         if self.config.validation_metric == "loss":
             epoch_metric = epoch_loss 
         else:
-            epoch_metric = float(np.mean(batch_metrics))
+            epoch_metric = epoch_meter.ask_metrics()[self.config.validation_metric]
 
-        print(
+        logger.info(
             f"{phase.capitalize()} Loss: {epoch_loss:.4f}, "
             f"{self.config.validation_metric.upper()}: {epoch_metric:.4f}"
         )
@@ -496,21 +509,21 @@ class Trainer:
                 - labels_cpu: ground-truth labels
         """
         has_masks = (
-            self.config.provide_agriculture_mask
+            self.config.provide_rpg_masks
             or self.config.downsample_loss
             or self.config.load_y_id
             or (self.config.transfer is not None and self.config.transfer.get("transfer"))
         )
         if has_masks:
             input_tuple, labels, masks_raw = item
-            masks = {k: v.to(self.device) for k, v in masks_raw.items()}
+            masks = {k: v.to(self.device, non_blocking=True) for k, v in masks_raw.items()}
         else:
             input_tuple, labels = item
             masks = {}
 
         if self.config.load_X_cloud:
             inputs, dates, X_cloud = input_tuple
-            X_cloud = X_cloud.to(self.device)
+            X_cloud = X_cloud.to(self.device, non_blocking=True)
         else:
             inputs, dates = input_tuple
     
@@ -523,9 +536,9 @@ class Trainer:
                 labels, self.config.y_transform, self.config.num_buckets
             ).to(self.device)
 
-        inputs = inputs.to(self.device)
-        dates = dates.to(self.device)
-        labels = labels.to(self.device)
+        inputs = inputs.to(self.device, non_blocking=True)
+        dates = dates.to(self.device, non_blocking=True)
+        labels = labels.to(self.device, non_blocking=True)
 
         self.optimizer.zero_grad()
 
@@ -670,11 +683,13 @@ class Trainer:
             self.scheduler.step(epoch_loss)
         else:
             self.scheduler.step()
+        current_lr = self.optimizer.param_groups[0]["lr"]
+        logger.info(f"LR after scheduler step: {current_lr:.2e}")
 
         # Save best model
         if is_best:
             self.checkpointer.save_best(self.model)
-            print(
+            logger.info(
                 f"New best model saved to temp dir with validation "
                 f"{self.config.validation_metric.upper()}: "
                 f"{self.metrics.best_metric:.4f}"
@@ -709,6 +724,7 @@ class Trainer:
             dict: Best model evaluation metrics
         """
         # Evaluate final model
+        logger.info("Evaluating final model...")
         self.evaluate_model_func(
             self.model,
             self.eval_dataloaders,
@@ -723,6 +739,7 @@ class Trainer:
 
         # Evaluate best model
         self.model = self.checkpointer.load_best(self.model)
+        logger.info("Evaluating best model...")
         best_model_eval = self.evaluate_model_func(
             self.model,
             self.eval_dataloaders,
@@ -749,50 +766,29 @@ class Trainer:
     def _get_full_dataset_frame(self):
         """Return all metadata rows filtered to the trainer's size_group."""
         library = MetadataLibrary()
-        return library._resolve_metadata(None, self.size_group)
+        return library._resolve_metadata(None, size_group=SizeGroup.LARGE)
 
-    def _evaluate_per_patch_performance(self, tempdir: str):
+    def _perform_inference_for_full_dataset(self, tempdir: str):
         """Evaluate model performance on each patch in the full dataset."""
         full_dataset_frame = self._get_full_dataset_frame()
-        augmentation_func = self._create_augmentation_func()
 
-        full_dataset_dataloader = setup_dataloaders(
-            metadata_frames={"test": full_dataset_frame},
-            data_path=self.config.data_path,
-            image_count=self.config.image_count,
-            num_buckets=self.config.num_buckets,
-            inclusion_intervals=self.config.inclusion_intervals,
-            normalization=self.config.normalization,
-            y_threshold=self.config.y_threshold,
-            y_transform=self.config.y_transform,
-            augmentation_func=augmentation_func,
-            batch_size=self.config.batch_size,
-            use_memmap=self.config.use_memmap,
-            provide_agriculture_masks=self.config.provide_agriculture_mask,
-            agriculture_mask_path=self.config.agriculture_mask_path,
-            downsample_loss=self.config.downsample_loss,
-            downsample_mask_path=self.config.downsample_mask_path,
-            load_X_cloud=self.config.load_X_cloud,
-            load_y_id=self.config.load_y_id,
-            cloud_threshold=self.config.cloud_threshold,
-            cloud_band=self.config.cloud_band,
-            cache_dir=self.config.cache_dir,
-            io_manager_kwargs=self.config.io_manager_kwargs,
-            num_workers=self.config.num_workers,
-            transfer=self.config.transfer,
+        config_cpy = copy.deepcopy(self.config)
+        config_cpy.metadata_frames = {"test": full_dataset_frame}
+        full_dataset_dataloader = dataloaders_from_config(
+            config=config_cpy,
+            shuffle=False
         )
 
-        evaluate_per_patch_performance(
-            self.model,
-            full_dataset_frame,
+        all_preds = full_dataset_inference(
+            model=self.model,
             dataloader=full_dataset_dataloader["test"],
-            save_path=tempdir,
             regression=self.config.regression,
-            num_buckets=self.config.num_buckets,
-            file_name="best_model_per_patch_performance",
             device=self.device,
-            save_data=True,
         )
+
+        torch.save(all_preds, pathlib.Path(tempdir, "full_dataset_predictions.pt"))
+
+
 
     # ========== Persistence Methods ==========
 
@@ -804,6 +800,7 @@ class Trainer:
 
     def _save_config(self, tempdir: str):
         """Save training configuration to JSON."""
+        logger.info("Saving run config to params.json...")
         now_timestamp = time.strftime(
             "%Y-%m-%d %H:%M:%S", time.localtime(time.time())
         )
@@ -852,25 +849,25 @@ class Trainer:
         """Move results from temporary to permanent storage."""
         permanent_save_path = self._get_permanent_save_path()
         shutil.copytree(tempdir, permanent_save_path, dirs_exist_ok=True)
-        print(f"Results successfully saved to {permanent_save_path}")
+        logger.info(f"Results successfully saved to {permanent_save_path}")
 
     # ========== Utility Methods ==========
 
     def _print_config(self):
         """Print training configuration."""
-        print("Training with parameters:")
-        print(f"  keyword: {self.config.keyword}")
-        print(f"  df lengths: {[len(f) for f in self.config.metadata_frames.values()]}")
-        print(f"  normalization: {self.config.normalization}")
-        print(f"  y_transform: {self.config.y_transform}")
-        print(f"  num_buckets: {self.config.num_buckets}")
-        print(f"  num_epochs: {self.config.num_epochs}")
-        print(f"  weighted: {self.config.class_weighted}")
-        print(f"  regression: {self.config.regression}")
-        print(f"  validation_metric: {self.config.validation_metric}")
-        print(f"  checkpoint_path: {self.config.checkpoint_path}")
-        print(f"  device: {self.config.device}")
-        print(f"  additional model params: {self.config.additional_model_params}")
+        logger.info("Training with parameters:")
+        logger.info(f"  keyword: {self.config.keyword}")
+        logger.info(f"  df lengths: {[len(f) for f in self.config.metadata_frames.values()]}")
+        logger.info(f"  normalization: {self.config.normalization}")
+        logger.info(f"  y_transform: {self.config.y_transform}")
+        logger.info(f"  num_buckets: {self.config.num_buckets}")
+        logger.info(f"  num_epochs: {self.config.num_epochs}")
+        logger.info(f"  weighted: {self.config.class_weighted}")
+        logger.info(f"  regression: {self.config.regression}")
+        logger.info(f"  validation_metric: {self.config.validation_metric}")
+        logger.info(f"  checkpoint_path: {self.config.checkpoint_path}")
+        logger.info(f"  device: {self.config.device}")
+        logger.info(f"  additional model params: {self.config.additional_model_params}")
 
     def _validate_config(self):
         """Validate configuration (called in __init__)."""
@@ -879,7 +876,7 @@ class Trainer:
 
     def _print_training_summary(self, time_elapsed: float):
         """Print training completion summary."""
-        print(
+        logger.info(
             f"Training complete in {time_elapsed // 60:.0f}m "
             f"{time_elapsed % 60:.0f}s"
         )

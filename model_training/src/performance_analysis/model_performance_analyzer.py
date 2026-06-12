@@ -12,7 +12,7 @@ from scipy import stats
 import torch
 from src.performance_analysis.evaluate_model import get_model_predictions
 from hedgementation_utils.metrics.seg_meter import SegMeter
-from src.training.dataset_dataloader import setup_dataloader
+from src.training.dataloader_utils import setup_dataloader
 from dotenv import load_dotenv
 import os
 
@@ -115,7 +115,7 @@ class ModelPerformanceAnalyzer:
 
         model_prediction_mapping, ground_truth = self.calc_prediction_mapping(self.experiment_names)
         self.model_prediction_mapping = model_prediction_mapping
-        self.ground_truth = ground_truth
+        self.ground_truth = ground_truth.reshape((-1,128,128))
 
         self.model_performance_on_data_subset = {}
         self.rpg_masks = {}

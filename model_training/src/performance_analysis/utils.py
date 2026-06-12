@@ -1,6 +1,8 @@
 import json
+import pathlib
 
 from src.performance_analysis.evaluate_model import get_model_predictions
+from src.training.dataloader_utils import dataloader_from_config
 from src.training.train_utils import ModelFactory
 from src.training.trainer_config import TrainerConfig
 import os
@@ -35,7 +37,9 @@ def get_model_prediction_from_model_path(model_dir: str,
                          checkpoint: str = "best_model_params.pt"):
     
 
-    model_root = os.path.join("models", model_dir)
+    model_root = pathlib.Path("models", model_dir)
+    if not pathlib.Path.exists(model_root):
+        model_root = pathlib.Path(model_dir)
 
     with open(os.path.join(model_root, "params.json"), "r+") as infile:
         params = json.load(infile)
@@ -49,8 +53,13 @@ def get_model_prediction_from_model_path(model_dir: str,
     )
 
     metadata_frame = pd.DataFrame({"id":[id for id in ids], "ID_PATCH":[id for id in ids]})
+    config.metadata_frames = {"test": metadata_frame}
     
-    dataloader = config.setup_dataloader_from_config(metadata_frame)
+    dataloader = dataloader_from_config(
+        config=config,
+        split="test",
+        shuffle=False
+    )
 
     preds, labels = get_model_predictions(model, dataloader, y_transform=config.y_transform)
 

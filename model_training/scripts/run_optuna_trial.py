@@ -95,7 +95,7 @@ def build_objective(args):
 
         # Apply path overrides
         if args.data_path:
-            override["data_path"] = args.data_path
+            override["dataset_root"] = args.data_path
         if args.save_path:
             override["save_path"] = args.save_path
         if args.batch_size is not None:

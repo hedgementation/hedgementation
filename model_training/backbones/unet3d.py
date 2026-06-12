@@ -1,10 +1,12 @@
 """
-Taken from https://github.com/roserustowicz/crop-type-mapping/
-Implementation by the authors of the paper :
+Taken from https://github.com/VSainteuf/utae-paps/blob/main/src/backbones/utae.py
+authors: Vivien Sainte Fare Garnot and Loic Landrieu  
+
+Modified version of implementation by the authors of the paper :
 "Semantic Segmentation of crop type in Africa: A novel Dataset and analysis of deep learning methods"
 R.M. Rustowicz et al.
 
-Slightly modified to support image sequences of varying length in the same batch.
+Slightly modified by  support image sequences of varying length in the same batch.
 """
 
 import torch
