@@ -1,0 +1,29 @@
+{
+  "legacy_asset": "data/gpkgs/bda_2024_patches_2024_classified.gpkg",
+  "created": "2026-06-11",
+  "aoi_bounds": [
+    -569582.6015267381,
+    5066798.146412208,
+    1064977.3984732619,
+    6634798.146412208
+  ],
+  "params": {
+    "tile_rows": 6,
+    "tile_cols": 6,
+    "tile_epsilon": 1,
+    "tile_buffer_pct": 0.1,
+    "patch_size": 1280,
+    "patches_per_cell": 12,
+    "patches_between_cells": 2,
+    "n_folds": 5,
+    "seed": 15
+  },
+  "validation": {
+    "tile_agreement": 1.0,
+    "impure_patches": 0,
+    "fold_agreement": 1.0,
+    "fold_agreement_assigned": 1.0,
+    "cells_without_legacy_patches": 4241,
+    "disagreeing_patches": 0
+  }
+}

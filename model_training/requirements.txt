@@ -1,0 +1,17 @@
+geopandas
+GitPython
+GitPython
+matplotlib
+numpy
+pandas
+Pillow
+ultralytics
+python-dotenv
+rasterio
+rioxarray
+scikit_learn
+seaborn
+Shapely
+torch
+torchmetrics
+torchvision

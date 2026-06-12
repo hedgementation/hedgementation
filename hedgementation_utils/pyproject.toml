@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hedgementation_utils"
+version = "0.1.0"
+requires-python = ">=3.9"
+authors = [
+    {name = "Nathan Senyard", email = "nathansenyard@gmail.com"}
+]
+
+description = "Shared utils for hedgementation project."
+
+
+dependencies = [
+    "geopandas",
+    "pandas",
+    "python-dotenv",
+    "numpy",
+    "torch",
+    "matplotlib",
+]

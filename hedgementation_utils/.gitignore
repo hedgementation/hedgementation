@@ -1,0 +1,8 @@
+.venv/*
+.env
+*.egg_info
+**/hedgementation_utils.egg-info/**
+/hedgementation_utils.egg-info/*
+*.pyc
+.vscode/*
+.claude/*

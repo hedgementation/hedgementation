@@ -1,0 +1,23 @@
+{
+    "source": "data/gpkgs/hedgementation_dataset_1.3/initial_metadata.geojson",
+    "satellite_folder": "hedgementation_dataset_1.3_X",
+    "hedgerow_folder": "hedgementation_dataset_1.3_y",
+    "identity_folder": "hedgementation_dataset_1.3_y_id",
+    "cloud_folder": "hedgementation_dataset_1.3_X_cloud",
+    "satellite_folder_id": "1kV50TlY0LNGi8C9eqlzSFFShaIJJJrVG",
+    "hedgerow_folder_id": "18xwudczHaSGoOQO6j1lbJ4ojrY1B7Q5M",
+    "identity_folder_id": "1uUijYXLA2Wjcz1C51zpICQNviM6hYQc3",
+    "cloud_folder_id": "1aKGZrh34IQj6tUAXma9PvqLQ1MZwXnrq",
+    "rpg_folder_id": "10XJwWAPpY-2MGHthzQk6UEDJiZzlhfKW",
+    "rpg_folder": "hedgementation_dataset_1.3_rpg_mask",
+    "no_cloud_filter": true,
+    "unified_bucket": "hedgementation_1_3",
+    "satellite_gcs_folder": "testin/X",
+    "hedgerow_gcs_folder": "testin/y",
+    "identity_gcs_folder": "testin/y_id",
+    "cloud_gcs_folder": "testin/X_cloud",
+    "rpg_gcs_folder": "testin/rpg",
+    "aef_gcs_folder": "testin/aef",
+    "rpg_path":"data/RPG_2-0__GPKG_LAMB93_FXX_2022-01-01/RPG/1_DONNEES_LIVRAISON_2023-08-01/RPG_2-0_GPKG_LAMB93_FXX-2022/PARCELLES_GRAPHIQUES.gpkg",
+    "destination_type": "gcs"
+}

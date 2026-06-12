@@ -1,0 +1,9 @@
+geopandas 
+pandas
+python-dotenv
+numpy
+torch
+matplotlib
+pytest
+webdataset
+rasterio
