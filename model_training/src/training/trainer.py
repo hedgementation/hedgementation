@@ -712,6 +712,7 @@ class Trainer:
             tempdir,
             self.config.num_buckets,
             self.config.y_transform,
+            self.config.load_y_id,
             save_extra_info=False,
             device=self.device,
         )
@@ -732,12 +733,14 @@ class Trainer:
             tempdir,
             self.config.num_buckets,
             self.config.y_transform,
+            self.config.load_y_id,
             save_extra_info=True,
             device=self.device,
         )
         self.checkpointer.save_most_recent(self.model)
 
         # Evaluate best model
+
         self.model = self.checkpointer.load_best(self.model)
         logger.info("Evaluating best model...")
         best_model_eval = self.evaluate_model_func(
@@ -747,6 +750,7 @@ class Trainer:
             tempdir,
             self.config.num_buckets,
             self.config.y_transform,
+            self.config.load_y_id,
             save_extra_info=True,
             device=self.device,
         )

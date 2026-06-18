@@ -166,7 +166,9 @@ class HedgementationDataset(torch.utils.data.Dataset):
         else:
             if self.cloud_threshold:
                 X, X_cloud, raw_dates = self.io_manager.load_X_data_with_cloud_threshold(
-                    identifier=identifier
+                    identifier=identifier,
+                    cloud_threshold=self.cloud_threshold,
+                    band=self.cloud_band
                 )
             else:
                 X, X_cloud, raw_dates = self.io_manager.load_X_data_date_aligned(

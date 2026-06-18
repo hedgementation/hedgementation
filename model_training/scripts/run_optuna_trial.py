@@ -136,15 +136,19 @@ def build_objective(args):
             skip_per_patch_eval=True,
         )
 
-        if not need_final_eval:
-            return trainer.metrics.best_iou
 
         value = best_model_eval.get(args.metric)
         if value is None:
-            raise ValueError(
-                f"Metric '{args.metric}' not found in eval dict. "
-                f"Available keys: {list(best_model_eval.keys())}"
-            )
+            if "iou_valid" in best_model_eval:
+                print(f"{args.metric} not available. Falling back to iou_valid...")
+                value = best_model_eval.get("iou_valid")
+            else:
+                raise ValueError(
+                    f"Metric '{args.metric}' not found in eval dict. "
+                    f"Available keys: {list(best_model_eval.keys())}"
+                )
+
+           
         # evaluate_model_classification wraps values in single-element lists
         return value[0] if isinstance(value, list) else float(value)
 

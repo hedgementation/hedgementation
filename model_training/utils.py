@@ -1,7 +1,9 @@
+import logging
 import os
 import json
-import re
 import glob
+import time 
+import datetime
 import geopandas as gpd
 import pandas as pd
 import traceback
@@ -11,17 +13,43 @@ from src.training.trainer import Trainer
 
 from src.training.experiments_registry import REGISTRY, deserialize_label_fn
 
+from src.logging_utils import setup_logging
+
+import time
+import datetime
+
+setup_logging()
+logger = logging.getLogger(__name__)
+
+def timer(function):
+    def wrapper(*args, **kwargs):
+        start = time.perf_counter()
+        result = function(*args, **kwargs)
+        end = time.perf_counter()
+        dt = datetime.timedelta(seconds=(end - start))
+        days = dt.days
+        hours, remainder = divmod(dt.seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        total_seconds = seconds + (dt.microseconds / 1_000_000)
+        parts = []
+        if days:
+            parts.append(f"{days}d")
+        if hours:
+            parts.append(f"{hours}h")
+        if minutes:
+            parts.append(f"{minutes}m")
+        parts.append(f"{total_seconds:.6f}s")
+        logger.info(f"[{function.__name__}] Runtime: " + " ".join(parts))
+        return result
+    return wrapper
+
 def load_experiments(root_dir):
     result = {}
-    pattern = re.compile(r"experiment_(\d+)$")
 
     for item in sorted(os.listdir(root_dir)):
         item_path = os.path.join(root_dir, item)
-        match = pattern.match(item)
-        if not match:
-            print(f"Warning: {item_path} is not named 'experiment_{{i}}'. Skipping.")
+        if not os.path.isdir(item_path):
             continue
-        i = int(match.group(1))
 
         metadata_path = os.path.join(item_path, "metadata")
         data_dict = {}
@@ -30,32 +58,32 @@ def load_experiments(root_dir):
                 split = os.path.splitext(os.path.basename(csv_file))[0]
                 try:
                     data_dict[split] = pd.read_csv(csv_file)
-                    print(f"✓ Successfully read {csv_file}")
+                    logger.info(f"✓ Successfully read {csv_file}")
                 except Exception as e:
-                    print(f"  Error: {e}")
-                    print(f"✗ Failed reading {csv_file}")
+                    logger.error(f"  Error: {e}")
+                    logger.error(f"✗ Failed reading {csv_file}")
                     return 1
         else:
-            print(f"Warning: No folder 'metadata' in {item_path}")
+            logger.warning(f"No folder 'metadata' in {item_path}")
 
-        config_file = os.path.join(root_dir, f"experiment_{i}_config.json")
+        config_file = os.path.join(root_dir, f"{item}_config.json")
         config_dict = {}
         if os.path.exists(config_file):
             try:
                 with open(config_file, "r") as f:
                     config_dict = json.load(f)
-                print(f"✓ Successfully read {config_file}")
+                logger.info(f"✓ Successfully read {config_file}")
             except Exception as e:
-                print(f"  Error: {e}")
-                print(f"✗ Failed reading {config_file}")
+                logger.error(f"  Error: {e}")
+                logger.error(f"✗ Failed reading {config_file}")
                 return 1
         else:
-            print(f"Warning: No file {config_file}")
+            logger.warning(f"No file {config_file}")
 
         # Migrate configs generated before data_path was renamed to dataset_root
         if "data_path" in config_dict:
             config_dict["dataset_root"] = config_dict.pop("data_path")
-            print(f"Note: migrated legacy 'data_path' key to 'dataset_root' in {config_file}")
+            logger.info(f"Note: migrated legacy 'data_path' key to 'dataset_root' in {config_file}")
 
         if config_dict.get("class_weights") == "autocalculated":
             config_dict["class_weights"] = None
@@ -63,68 +91,57 @@ def load_experiments(root_dir):
             config_dict["transfer"] = deserialize_label_fn(config_dict["transfer"])
 
         config_dict["metadata_frames"] = data_dict
-        result[i] = config_dict
+        result[item] = config_dict
 
     return result
 
 
-def save_experiments(root_dir, configs, matching_path):
-    matching = {}
+def save_experiments(root_dir, configs):
+    used_exp_keywords = []
+    used_config_keywords = []
 
-    for i, (exp_keyword, config) in enumerate(configs.items()):
-        metadata_dir = os.path.join(root_dir, f"experiment_{i}", "metadata")
+    for exp_keyword, config in configs.items():
+        metadata_dir = os.path.join(root_dir, f"{exp_keyword}", "metadata")
         try:
             os.makedirs(metadata_dir, exist_ok=True)
-            print(f"✓ Successfully generated directory {metadata_dir}")
+            logger.info(f"✓ Successfully generated directory {metadata_dir}")
         except Exception as e:
-            print(f"  Error: {e}")
-            print(f"✗ Failed generating directory {metadata_dir}")
+            logger.error(f"  Error: {e}")
+            logger.error(f"✗ Failed generating directory {metadata_dir}")
             return 1
 
         for split, frame in config.metadata_frames.items():
             file_path = os.path.join(metadata_dir, f"{split}.csv")
             try:
                 frame.to_csv(file_path, index=False)
-                print(f"✓ Successfully generated file {file_path}")
+                logger.info(f"✓ Successfully generated file {file_path}")
             except Exception as e:
-                print(f"  Error: {e}")
-                print(f"✗ Failed generating file {file_path}")
+                logger.error(f"  Error: {e}")
+                logger.error(f"✗ Failed generating file {file_path}")
                 return 1
 
-        config_path = os.path.join(root_dir, f"experiment_{i}_config.json")
+        config_path = os.path.join(root_dir, f"{exp_keyword}_config.json")
         try:
             with open(config_path, "w") as f:
                 json.dump(config.to_dict(), f, indent=4)
-            print(f"✓ Successfully generated file {config_path}")
+            logger.info(f"✓ Successfully generated file {config_path}")
         except Exception as e:
-            print(f"  Error: {e}")
-            print(f"✗ Failed generating file {config_path}")
+            logger.error(f"  Error: {e}")
+            logger.error(f"✗ Failed generating file {config_path}")
             return 1
 
-        if exp_keyword in [v["exp_keyword"] for v in matching.values()]:
-            print(f"Error: exp_keyword '{exp_keyword}' used twice. Keywords must be unique")
+        if exp_keyword in used_exp_keywords:
+            logger.error(f"✗ exp_keyword '{exp_keyword}' used twice. Keywords must be unique")
             return 1
+        
+        if config.keyword in used_config_keywords:
+            logger.warning(f"config_keyword '{config.keyword}' used twice. Results might be override")
 
-        matching[i] = {
-            "exp_keyword": exp_keyword,
-            "config_keyword": config.keyword,
-        }
-
-    matching_file = os.path.join(root_dir, matching_path)
-    try:
-        with open(matching_file, "w") as f:
-            json.dump(matching, f, indent=4)
-        print(f"✓ Successfully generated matching file {matching_file}")
-    except Exception as e:
-        print(f"  Error: {e}")
-        print(f"✗ Failed generating matching file {matching_file}")
-        return 1
-
+        used_exp_keywords.append(exp_keyword)
+        used_config_keywords.append(config.keyword)
     return 0
 
 def train(
-    experiments_dir,
-    matching_path,
     config_dict,
     output_dir=None,
     data_path=None,
@@ -133,29 +150,12 @@ def train(
     batch_size=None,
     smoke_test=False,
 ):
-    matching_file = os.path.join(experiments_dir, matching_path)
-    try:
-        with open(matching_file, "r") as f:
-            matching = json.load(f)
-        print(f"✓ Successfully read {matching_file}")
-    except Exception as e:
-        print(f"  Error: {e}")
-        print(f"✗ Failed reading {matching_file}")
-        return 1
+    for exp, cfg in config_dict.items():
+        exp_keyword = exp
 
-    for num_exp, cfg in config_dict.items():
-        entry = matching.get(str(num_exp), {})
-        exp_keyword    = entry.get("exp_keyword",    f"experiment_{num_exp}")
-        config_keyword = entry.get("config_keyword", None)
-
-        print("\n")
-        print("=" * 10)
-        print(f"Training experiment '{exp_keyword}'...")
-        print("=" * 10)
-
-        # Restore config_keyword so Trainer names the save dir correctly.
-        if config_keyword:
-            cfg["keyword"] = config_keyword
+        logger.info("=" * 10)
+        logger.info(f"Training experiment '{exp_keyword}'...")
+        logger.info("=" * 10)
 
         if output_dir is not None:
             cfg["save_path"]    = output_dir
@@ -176,7 +176,7 @@ def train(
             cfg["batch_size"] = batch_size
 
         if smoke_test:
-            print("Smoke test: 1 epoch, truncated dataset, evals skipped")
+            logger.info("Smoke test: 1 epoch, truncated dataset, evals skipped")
             cfg["num_epochs"] = 1
             cfg["datapoint_limit"] = 2 * (batch_size or cfg.get("batch_size", 4))
             cfg["skip_untrained_eval"] = True
@@ -189,7 +189,7 @@ def train(
 
     return 0
 
-
+@timer
 def run_single_experiment(config_dict):
     try:
         trainer_config = TrainerConfig(**config_dict)
@@ -201,14 +201,14 @@ def run_single_experiment(config_dict):
             skip_final_eval=trainer_config.skip_final_eval,
             skip_full_dataset_inference=trainer_config.skip_full_dataset_inference,
         )
-        print("✓ Training Completed Successfully")
-        print(f"Best validation {config_dict['validation_metric']}: {trainer.metrics.best_metric:.4f}")
-        print(f"Best epoch: {trainer.metrics.best_epoch}")
+        logger.info("✓ Training Completed Successfully")
+        logger.info(f"Best validation {config_dict['validation_metric']}: {trainer.metrics.best_metric:.4f}")
+        logger.info(f"Best epoch: {trainer.metrics.best_epoch}")
         return 0
     except Exception as e:
-        print(f"  Error: {e}")
+        logger.error(f"  Error: {e}")
         traceback.print_exc()
-        print("✗ Training failed")
+        logger.error("✗ Training failed")
         return 1
 
 

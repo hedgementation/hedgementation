@@ -12,7 +12,7 @@ This tutorial assumes that you have already downloaded and set up the Hedgementa
 
 2. Run `pip install -r requirements.txt`.
 
-3. Run `pip install ../hedgementation_utils`. This will install the project's dedicated utils repo which is necessary for the code to run.
+3. Run `pip install git+ssh://github.com/hedgementation/hedgementation_utils`. This will install the project's dedicated utils repo which is necessary for the code to run.
 
 4. Run `python3 run.py --keywords test` to ensure the code runs properly. 
  

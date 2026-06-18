@@ -1,6 +1,5 @@
 geopandas
 GitPython
-GitPython
 matplotlib
 numpy
 pandas
@@ -12,7 +11,11 @@ rioxarray
 scikit_learn
 seaborn
 Shapely
+optuna
 torch
 torchmetrics
 torchvision
+scikit-learn
+xgboost
 webdataset
+debugpy

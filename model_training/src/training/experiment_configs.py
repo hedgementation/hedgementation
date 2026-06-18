@@ -139,26 +139,21 @@ def save_experiment_configs(output_dir: str = "experiments") -> int:
     os.makedirs(output_dir, exist_ok=True)
     experiments = get_experiment_configs(return_ordered_dict=True)
 
-    matching = {}
-    for idx, (keyword, config) in enumerate(experiments.items()):
-        metadata_dir = os.path.join(output_dir, f"experiment_{idx}", "metadata")
+    for keyword, config in experiments.items():
+        metadata_dir = os.path.join(output_dir, f"{keyword}", "metadata")
         os.makedirs(metadata_dir, exist_ok=True)
 
         for split, frame in config.metadata_frames.items():
             frame.to_csv(os.path.join(metadata_dir, f"{split}.csv"))
 
-        config_path = os.path.join(output_dir, f"experiment_{idx}_config.json")
+        config_path = os.path.join(output_dir, f"{keyword}_config.json")
         with open(config_path, "w") as f:
             json.dump(config.to_dict(), f, indent=4)
+    
+    num_exp = len(experiments)
 
-        matching[idx] = {"exp_keyword": keyword, "config_keyword": keyword}
-
-    matching_path = os.path.join(output_dir, "predefined_experiments_matching.json")
-    with open(matching_path, "w") as f:
-        json.dump(matching, f, indent=4)
-
-    print(f"Saved {len(experiments)} experiment configurations to {output_dir}")
-    return len(experiments)
+    print(f"Saved {num_exp} experiment configurations to {output_dir}")
+    return num_exp
 
 
 if __name__ == "__main__":

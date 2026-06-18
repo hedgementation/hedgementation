@@ -90,13 +90,14 @@ class TrainerConfig:
     reference_date: str = "2021-09-17"
     target_size: int = 128
     size_group: SizeGroup = SizeGroup.SMALL
-    image_count: int = 10
+    datapoint_limit: Optional[int] = None #Optional cap for datapoints to use, useful for testing 
+    image_count: int = None
     batch_size: int = 16
     eval_batch_size: Optional[int] = 32
     use_memmap: bool = False
     metadata_frames: Optional[dict[str,gpd.GeoDataFrame]] = None
     load_X_cloud: bool = True
-    load_y_id: bool = False
+    load_y_id: bool = True
     cloud_threshold: Optional[float] = 0.2
     cloud_band: int = 0
     cache_dir: Optional[str] = os.environ.get("CACHE_DIR", None)
@@ -199,6 +200,9 @@ class TrainerConfig:
             except:
                 self.lr_scheduler = LRSchedule[self.lr_scheduler]
         
+        if isinstance(self.size_group, int):
+            self.size_group = SizeGroup(self.size_group)
+        
         if self.metadata_frames:
             for k in self.metadata_frames:
                 if isinstance(self.metadata_frames[k], str):
@@ -231,6 +235,8 @@ class TrainerConfig:
             new = self.transfer 
 
         return {
+            "keyword": self.keyword,
+            "reference_date": self.reference_date,
             "backbone": self.backbone.value,
             "loss_function": self.loss_function.__name__,
             "normalization": self.normalization.value,
@@ -238,19 +244,27 @@ class TrainerConfig:
             "num_buckets": self.num_buckets,
             "y_threshold": self.y_threshold,
             "class_weighted": self.class_weighted,
+            "trainable_params": self.trainable_params,
+            "skip_untrained_eval": self.skip_untrained_eval,
+            "skip_final_eval": self.skip_final_eval,
+            "skip_full_dataset_inference": self.skip_full_dataset_inference, 
             "batch_size": self.batch_size,
             "eval_batch_size": self.eval_batch_size,
+            "target_size": self.target_size,
+            "size_group": self.size_group.value,
             "num_workers": self.num_workers,
             "class_weights": (
                 "autocalculated"
                 if self.class_weighted and not self.class_weights
                 else self.class_weights
             ),
+            "use_memmap": self.use_memmap,
             "regression": self.regression,
             "num_epochs": self.num_epochs,
             "checkpoint_path": self.checkpoint_path,
             "augmentation": str(self.augmentation),
             "image_count": self.image_count,
+            "device": self.device,
             "lr": self.lr,
             "lr_scheduler": self.lr_scheduler.name,
             "lr_scheduler_args": self.lr_scheduler_args,
@@ -260,6 +274,10 @@ class TrainerConfig:
             "early_stopping_min_delta": self.early_stopping_min_delta,
             "inclusion_intervals": self.inclusion_intervals,
             "additional_model_params": self.additional_model_params,
+            "datapoint_limit": self.datapoint_limit,
+            "dataset_root": self.dataset_root,
+            "save_results": self.save_results,
+            "save_path": self.save_path,
             "provide_rpg_masks": self.provide_rpg_masks,
             "rpg_mask_subdir": self.rpg_mask_subdir,
             "downsample_loss": self.downsample_loss,
@@ -269,6 +287,7 @@ class TrainerConfig:
             "cloud_threshold": self.cloud_threshold,
             "cloud_band": self.cloud_band,
             "cache_dir": self.cache_dir,
+            "io_manager_kwargs": self.io_manager_kwargs,
             "validation_metric": self.validation_metric,
             "transfer": new,
         }

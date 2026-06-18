@@ -9,11 +9,11 @@ raw predictions — and computes MAE, MSE, RMSE, R² at epoch end.
 import torch
 
 
-_HIGHER_IS_BETTER = {"r2"}
+_HIGHER_IS_BETTER = {"r2", "iou", "f1", "pre", "acc", "all_acc", "freq_iou"}
 
 REGRESSION_METRICS = {"mae", "mse", "rmse", "r2", "loss"}
 
-CLASSIFICATION_METRICS = {"iou", "f1", "precision", "recall","loss"}
+CLASSIFICATION_METRICS = {"all_acc", "acc", "pre", "f1", "iou", "freq_iou", "loss"}
 
 
 def higher_is_better(metric: str) -> bool:
@@ -62,6 +62,9 @@ class RegMeter:
         self.sum_sq_err += (diff ** 2).sum().item()
         self.sum_labels += labels.sum().item()
         self.sum_sq_labels += (labels ** 2).sum().item()
+
+    def update_batch(self, preds: torch.Tensor, labels: torch.Tensor):
+        return self.update(preds=preds, labels=labels)
 
     def score(self) -> dict:
         """

@@ -70,12 +70,6 @@ def parse_args():
     )
     add_behavior_flags(parser)
     parser.add_argument(
-        "--experiment_indices",
-        type=str,
-        default=None,
-        help="Comma-separated list of experiment indices to run (e.g., '0,2,5'). If not specified, runs all.",
-    )
-    parser.add_argument(
         "--ssh_key",
         type=str,
         default=None,
@@ -149,7 +143,7 @@ def create_slurm_script(
     output_path: str,
     source_dir: str,
     gpu_config: str = None,
-    experiment_indices: str = None,
+    selected_names: list = None,
     exclude: str = None,
     ssh_key: str = None,
     batch_size: int = 4,
@@ -164,10 +158,31 @@ def create_slurm_script(
     else:
         experiment_dir_line = f"EXPERIMENT_DIR=$SOURCEDIR/{experiments_dir}"
 
-    if experiment_indices:
+    if selected_names:
+        all_names = sorted(
+            d for d in os.listdir(experiments_dir)
+            if os.path.isdir(os.path.join(experiments_dir, d))
+            and os.path.isdir(os.path.join(experiments_dir, d, "metadata"))
+            and os.path.exists(os.path.join(experiments_dir, f"{d}_config.json"))
+        )
+        indices = [all_names.index(n) for n in selected_names]
+        experiment_indices = ",".join(str(i) for i in indices)
         array_spec = f"--array={experiment_indices}%{max_parallel}"
     else:
         array_spec = f"--array=0-{num_experiments-1}%{max_parallel}"
+
+    name_discovery_block = """\
+# Discover experiment names: each must have a NAME/metadata directory and a
+# matching NAME_config.json file in $EXPERIMENT_DIR. Other files/dirs are skipped.
+ALL_NAMES=()
+for d in "$EXPERIMENT_DIR"/*/; do
+    name=$(basename "$d")
+    if [ -d "$d/metadata" ] && [ -f "$EXPERIMENT_DIR/${name}_config.json" ]; then
+        ALL_NAMES+=("$name")
+    fi
+done
+
+EXP_NAME=${ALL_NAMES[$SLURM_ARRAY_TASK_ID]}"""
 
     effective_num_workers = num_workers if num_workers is not None else cpus_per_task
 
@@ -278,8 +293,9 @@ echo "=========================================="
 # Define paths
 SOURCEDIR={source_dir}
 {experiment_dir_line}
-CONFIG_FILE=$EXPERIMENT_DIR/experiment_${{SLURM_ARRAY_TASK_ID}}_config.json
-EXPERIMENT_SUBDIR=$EXPERIMENT_DIR/experiment_${{SLURM_ARRAY_TASK_ID}}
+{name_discovery_block}
+CONFIG_FILE=$EXPERIMENT_DIR/${{EXP_NAME}}_config.json
+EXPERIMENT_SUBDIR=$EXPERIMENT_DIR/$EXP_NAME
 
 # Check if experiment directory exists
 if [ ! -d "$EXPERIMENT_SUBDIR" ]; then
@@ -311,7 +327,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 python3 -u run.py \\
     --slurm_worker \\
-    --experiment_dir "$EXPERIMENT_SUBDIR" \\
+    --experiments_dir "$EXPERIMENT_SUBDIR" \\
     --data_path "$SLURM_TMPDIR/data" \\
     --output_dir "$SLURM_TMPDIR/models" \\
     --cache_dir "$SLURM_TMPDIR/cache" \\
@@ -377,7 +393,7 @@ echo "=========================================="
     return output_path
 
 
-def run_local_smoke_test(script_path, selected_indices, num_experiments, args):
+def run_local_smoke_test(script_path, selected_names, args):
     """Sanity-check the pipeline locally before requesting a SLURM allocation.
 
     Runs the exact command the SLURM script runs (run.py --slurm_worker) for each
@@ -408,13 +424,10 @@ def run_local_smoke_test(script_path, selected_indices, num_experiments, args):
         logger.error("  Set it in .env to your local dataset root to run the local test.")
         return 1
 
-    if selected_indices:
-        indices = [int(i) for i in selected_indices.split(",")]
-    else:
-        indices = list(range(num_experiments))
-    if len(indices) > 1:
-        logger.info(f"Testing {len(indices)} experiments. Narrow the set with "
-                    "--experiment_indices or --experiment_keywords if this is too slow.")
+    names = list(selected_names)
+    if len(names) > 1:
+        logger.info(f"Testing {len(names)} experiments. Narrow the set with "
+                    "--experiment_keywords if this is too slow.")
 
     effective_num_workers = (
         args.num_workers if args.num_workers is not None else args.cpus_per_task
@@ -425,13 +438,13 @@ def run_local_smoke_test(script_path, selected_indices, num_experiments, args):
         cache_dir = os.path.join(tmpdir, "cache")
         os.makedirs(models_dir)
 
-        for idx in indices:
-            exp_dir = os.path.join(args.experiments_dir, f"experiment_{idx}")
+        for name in names:
+            exp_dir = os.path.join(args.experiments_dir, name)
             cmd = [
                 sys.executable, "-u", "run.py",
                 "--slurm_worker",
                 "--smoke_test",
-                "--experiment_dir", exp_dir,
+                "--experiments_dir", exp_dir,
                 "--data_path", dataset_root,
                 "--output_dir", models_dir,
                 "--cache_dir", cache_dir,
@@ -442,14 +455,14 @@ def run_local_smoke_test(script_path, selected_indices, num_experiments, args):
             if args.gpu:
                 cmd += ["--gpu", args.gpu]
             logger.info("-" * 40)
-            logger.info(f"Experiment {idx}: {' '.join(cmd)}")
+            logger.info(f"Experiment {name}: {' '.join(cmd)}")
             logger.info("-" * 40)
             result = subprocess.run(cmd)
             if result.returncode != 0:
-                logger.error(f"✗ Local test failed for experiment {idx} "
+                logger.error(f"✗ Local test failed for experiment '{name}' "
                              f"(exit code {result.returncode})")
                 return 1
-            logger.info(f"✓ Experiment {idx} passed")
+            logger.info(f"✓ Experiment '{name}' passed")
 
     resubmit_args = [a for a in sys.argv if a != "--local_test"]
     logger.info("=" * 40)
@@ -499,53 +512,60 @@ def main():
     if args.config_paths:
         logger.info(f"Loading {len(args.config_paths)} custom config(s) into '{args.experiments_dir}'...")
         experiments = {}
-        matching = {}
-        for i, path in enumerate(args.config_paths):
-            dest = Path(args.experiments_dir) / f"experiment_{i}_config.json"
-            shutil.copy(path, str(dest))
-            with open(path) as f:
-                config_data = json.load(f)
-            keyword = config_data.get("keyword", Path(path).stem)
-            experiments[keyword] = SimpleNamespace(keyword=keyword)
-            exp_dir = Path(args.experiments_dir) / f"experiment_{i}"
-            (exp_dir / "metadata").mkdir(parents=True, exist_ok=True)
-            matching[i] = {"exp_keyword": keyword, "config_keyword": keyword}
-        matching_path = Path(args.experiments_dir) / "predefined_experiments_matching.json"
-        with open(matching_path, "w") as f:
-            json.dump(matching, f, indent=4)
-        num_experiments = len(args.config_paths)
+        for path_str in args.config_paths:
+            config_path = Path(path_str)
+            if not config_path.name.endswith("_config.json"):
+                logger.error(f"✗ {config_path.name} does not match the expected 'name_config.json' format.")
+                return 1
+            name = config_path.name[:-12]
+            parent_dir = config_path.parent
+            original_folder_path = parent_dir / name
+            metadata_path = original_folder_path / "metadata"
+            if not original_folder_path.is_dir():
+                logger.error(f"✗ Associated folder '{name}' not found in {parent_dir}")
+                return 1
+                
+            if not metadata_path.is_dir():
+                logger.error(f"✗ 'metadata' folder is missing or invalid in {original_folder_path}")
+                return 1
+
+            dest_json = Path(args.experiments_dir) / config_path.name
+            dest_folder = Path(args.experiments_dir) / name
+            if dest_json.exists():
+                logger.error(f"✗ Configuration file '{config_path.name}' already exists in {args.experiments_dir}")
+                return 1
+
+            if dest_folder.exists():
+                logger.error(f"✗ Folder '{name}' already exists in {args.experiments_dir}")
+                return 1
+
+            shutil.copy(str(config_path), str(dest_json))
+            shutil.copytree(str(original_folder_path), str(dest_folder), dirs_exist_ok=True)
+
+            with open(config_path, "r") as f:
+                config = json.load(f)
+            experiments[name] = SimpleNamespace(**config)
+        num_experiments = len(experiments)
     else:
         logger.info(f"Generating experiment configurations in '{args.experiments_dir}'...")
         num_experiments = save_experiment_configs(args.experiments_dir)
         experiments = get_experiment_configs()
 
     logger.info(f"Loaded {num_experiments} experiments:")
-    for idx, (config_keyword, exp) in enumerate(experiments.items()):
-        logger.info(f"  [{idx}] {config_keyword}  ({exp.keyword})")
+    for idx, (exp_keyword, config) in enumerate(experiments.items()):
+        logger.info(f"  [{idx}] {exp_keyword}  ({config.keyword})")
 
     # Resolve --experiment_keywords to a comma-separated index string (takes precedence over --experiment_indices)
-    selected_indices = None
     if args.experiment_keywords:
         keyword_to_idx = {k: i for i, k in enumerate(experiments.keys())}
-        resolved = []
         for kw in args.experiment_keywords:
             if kw not in keyword_to_idx:
                 logger.error(f"Unknown keyword '{kw}'. Available: {list(keyword_to_idx.keys())}")
                 return 1
-            resolved.append(keyword_to_idx[kw])
-        selected_indices = ",".join(str(i) for i in resolved)
+        selected_names = list(args.experiment_keywords)
         logger.info(f"Running experiments by keyword: {' '.join(args.experiment_keywords)}")
-    elif args.experiment_indices:
-        parsed_indices = [int(i) for i in args.experiment_indices.split(",")]
-        for idx in parsed_indices:
-            if idx >= num_experiments:
-                logger.error(f"Experiment index {idx} out of range (0-{num_experiments-1})")
-                return 1
-        selected_indices = ",".join(str(i) for i in parsed_indices)
-
-    if selected_indices:
-        logger.info(f"Running specific experiments: {selected_indices}")
     else:
+        selected_names = list(experiments.keys())
         logger.info(f"Running all {num_experiments} experiments")
 
     logger.info("Creating SLURM submission script...")
@@ -559,7 +579,7 @@ def main():
         output_path="scripts/slurm_array_job_generated.sh",
         source_dir=args.source_dir or os.getcwd(),
         gpu_config=args.gpu,
-        experiment_indices=selected_indices,
+        selected_names=selected_names,
         exclude=args.exclude,
         ssh_key=args.ssh_key,
         num_workers=args.num_workers,
@@ -587,7 +607,7 @@ def main():
         return 0
 
     if args.local_test:
-        return run_local_smoke_test(script_path, selected_indices, num_experiments, args)
+        return run_local_smoke_test(script_path, selected_names, args)
 
     if args.dry_run:
         logger.info("--dry_run flag set. Would submit:")

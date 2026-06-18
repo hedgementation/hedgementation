@@ -1,11 +1,9 @@
 import logging
 import os
-import re
 import sys
 import argparse
 import debugpy
 from dotenv import load_dotenv
-import json
 import subprocess
 
 from src.training.trainer_config import TrainerConfig
@@ -22,7 +20,7 @@ from scripts.submit_experiments import create_slurm_script, _GPU_SLURM_DIRECTIVE
 load_dotenv()
 setup_logging()
 logger = logging.getLogger(__name__)
-NUM_TILEGROUPS = int(os.environ.get("NUM_TILEGROUPS", "5"))
+NUM_EXP = int(os.environ.get("NUM_EXP", "1"))
 
 
 def run(
@@ -31,7 +29,6 @@ def run(
     keywords=None,
     slurm=False,
     slurm_worker=False,
-    experiment_dir=None,
     data_path=None,
     max_parallel=4,
     time_limit="12:00:00",
@@ -39,10 +36,9 @@ def run(
     cpus_per_task=1,
     account="def-mlecuyer",
     gpu_config=None,
-    generate_only=False,
     dry_run=False,
-    experiment_indices=None,
-    prepare_only=False,
+    experiment_keywords=None,
+    generate_only=False,
     run_only=False,
     batch_size=4,
     num_workers=None,
@@ -50,8 +46,8 @@ def run(
     cache_dir=None,
     smoke_test=False,
 ):
-    if prepare_only and run_only:
-        logger.error("✗ --prepare_only and --run_only are mutually exclusive")
+    if generate_only and run_only:
+        logger.error("✗ --generate_only and --run_only are mutually exclusive")
         return 1
 
     if slurm and smoke_test:
@@ -67,30 +63,23 @@ def run(
             return 1
 
     if slurm_worker:
-        if experiment_dir is None:
+        if experiments_dir is None:
             logger.error("✗ --slurm_worker requires --experiment_dir")
             return 1
-
-        exp_root = os.path.dirname(experiment_dir)
-        exp_name = os.path.basename(experiment_dir)
-        match = re.match(r"experiment_(\d+)$", exp_name)
-        if not match:
-            logger.error(f"✗ Cannot parse experiment index from '{exp_name}'")
-            return 1
-        exp_idx = int(match.group(1))
+        
+        exp_root = os.path.dirname(experiments_dir)
+        exp_name = os.path.basename(experiments_dir)
 
         config_dict = load_experiments(exp_root)
         if config_dict == 1:
             return 1
 
-        if exp_idx not in config_dict:
-            logger.error(f"✗ Experiment {exp_idx} not found after loading '{exp_root}'")
+        if exp_name not in config_dict:
+            logger.error(f"✗ Experiment '{exp_name}' not found after loading '{exp_root}'")
             return 1
-        single = {exp_idx: config_dict[exp_idx]}
+        single = {exp_name: config_dict[exp_name]}
 
         return train(
-            experiments_dir=exp_root,
-            matching_path="predefined_experiments_matching.json",
             config_dict=single,
             output_dir=output_dir,
             data_path=data_path,
@@ -99,7 +88,6 @@ def run(
             batch_size=batch_size,
             smoke_test=smoke_test,
         )
-
     if not run_only:
         logger.info("=" * 10)
         logger.info("Creating directories...")
@@ -155,7 +143,7 @@ def run(
         keyword_map = {}
         try:
             for kw in keywords:
-                overrides_dict = get_multi_experiment_overrides(kw, nb_exp=NUM_TILEGROUPS)
+                overrides_dict = get_multi_experiment_overrides(kw, nb_exp=NUM_EXP)
                 if len(overrides_dict) > 1:
                     for i, override in overrides_dict.items():
                         sub_keyword = f"{kw}_{i}"
@@ -180,11 +168,10 @@ def run(
             save_exp = save_experiments(
                 root_dir=experiments_dir,
                 configs=keyword_map,
-                matching_path="predefined_experiments_matching.json",
             )
             if save_exp == 0:
                 logger.info(f"✓ Successfully saved {len(keyword_map)} experiments in {experiments_dir}")
-                if prepare_only:
+                if generate_only:
                     return 0
             else:
                 logger.error(f"✗ Failed to save predefined experiments in {experiments_dir}")
@@ -197,12 +184,30 @@ def run(
         num_experiments = len(keyword_map)
 
     if slurm:
+        if generate_only:
+            return 0
+        
+        available_names = [
+                item for item in sorted(os.listdir(experiments_dir))
+                if os.path.isdir(os.path.join(experiments_dir, item))
+                and os.path.isdir(os.path.join(experiments_dir, item, "metadata"))
+                and os.path.exists(os.path.join(experiments_dir, f"{item}_config.json"))
+            ]
+        
         if run_only:
-            pattern = re.compile(r"experiment_(\d+)$")
-            num_experiments = sum(
-                1 for item in os.listdir(experiments_dir)
-                if pattern.match(item)
-            )
+            num_experiments = len(available_names)
+
+        # Resolve --experiment_keywords to a list of selected experiment names
+        if experiment_keywords:
+            for kw in experiment_keywords:
+                if kw not in available_names:
+                    logger.error(f"✗ Unknown keyword '{kw}'. Available: {available_names}")
+                    return 1
+            selected_names = list(experiment_keywords)
+            logger.info(f"Running experiments by keyword: {' '.join(experiment_keywords)}")
+        else:
+            selected_names = available_names
+            logger.info(f"Running all {num_experiments} experiments")
 
         logger.info("=" * 10)
         logger.info("SLURM submission...")
@@ -222,7 +227,7 @@ def run(
             output_path="scripts/slurm_array_job_generated.sh",
             source_dir=os.getcwd(),
             gpu_config=gpu_config,
-            experiment_indices=experiment_indices,
+            selected_names=selected_names,
             num_workers=num_workers,
             batch_size=batch_size,
             data_archive=data_archive,
@@ -238,11 +243,6 @@ def run(
         logger.info(f"  Max parallel : {max_parallel}")
         if gpu_config:
             logger.info(f"  GPU config   : {gpu_config}  ({_GPU_SLURM_DIRECTIVES[gpu_config].lstrip('#SBATCH ')})")
-
-        if generate_only:
-            logger.info("--generate_only set. Skipping execution.")
-            logger.info("To submit manually: sbatch scripts/slurm_array_job_generated.sh")
-            return 0
 
         if dry_run:
             logger.info(f"--dry_run set. Would run: sbatch {script_path}")
@@ -290,8 +290,6 @@ def run(
     if loaded:
         try:
             result = train(
-                experiments_dir=experiments_dir,
-                matching_path="predefined_experiments_matching.json",
                 config_dict=loaded,
                 output_dir=output_dir,
                 data_path=data_path,
@@ -328,8 +326,6 @@ if __name__ == "__main__":
                         help="Submit as SLURM array job instead of running locally")
     parser.add_argument("--slurm_worker", action="store_true",
                         help="Internal flag — called by SLURM tasks, do not use manually")
-    parser.add_argument("--experiment_dir", type=str, default=None,
-                        help="(--slurm_worker) Path to a single experiment_{i} directory")
     parser.add_argument("--data_path", type=str, default=None,
                         help="Override data path (slurm worker or local)")
     parser.add_argument("--cache_dir", type=str, default=None,
@@ -338,7 +334,7 @@ if __name__ == "__main__":
     # SLURM job options
     parser.add_argument("--max_parallel", type=int, default=4)
     parser.add_argument("--time", type=str, default="12:00:00")
-    parser.add_argument("--mem_per_cpu", type=str, default="20G")
+    parser.add_argument("--mem_per_cpu", type=str, default="8G")
     parser.add_argument("--cpus_per_task", type=int, default=None)
     parser.add_argument("--account", type=str, default="def-mlecuyer")
     parser.add_argument(
@@ -356,11 +352,10 @@ if __name__ == "__main__":
             "Omit to request no GPU."
         ),
     )
-    parser.add_argument("--generate_only", action="store_true")
     parser.add_argument("--dry_run", action="store_true")
-    parser.add_argument("--experiment_indices", type=str, default=None,
-                        help="Comma-separated indices to run (e.g. '0,2,5')")
-    parser.add_argument("--prepare_only", action="store_true",
+    parser.add_argument("--experiment_keywords", type=str, nargs="*", default=None,
+                        help="Run only the experiments matching these keywords (names of experiment_dir subfolders).")
+    parser.add_argument("--generate_only", action="store_true",
                         help="Save experiments to disk without training.")
     parser.add_argument("--run_only", action="store_true",
                         help="Read saved experiments from experiments_dir and train them.")
@@ -399,7 +394,6 @@ if __name__ == "__main__":
         keywords=keywords,
         slurm=args.slurm,
         slurm_worker=args.slurm_worker,
-        experiment_dir=args.experiment_dir,
         data_path=args.data_path,
         max_parallel=args.max_parallel,
         time_limit=args.time,
@@ -407,10 +401,9 @@ if __name__ == "__main__":
         cpus_per_task=args.cpus_per_task,
         account=args.account,
         gpu_config=args.gpu,
-        generate_only=args.generate_only,
         dry_run=args.dry_run,
-        experiment_indices=args.experiment_indices,
-        prepare_only=args.prepare_only,
+        experiment_keywords=args.experiment_keywords,
+        generate_only=args.generate_only,
         run_only=args.run_only,
         batch_size=args.batch_size,
         num_workers=args.num_workers,

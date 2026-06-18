@@ -2,6 +2,7 @@ import gc
 import json
 import logging
 import os
+import pathlib
 import sys
 from typing import Union
 from matplotlib import pyplot as plt
@@ -12,13 +13,18 @@ import seaborn as sns
 from torchmetrics import JaccardIndex
 import geopandas as gpd
 
-from hedgementation_utils.metrics.per_hedge_analysis import calc_hedge_detection_rate, calc_mean_hedge_accuracy, calc_patch_per_hedge_accuracy
 from src.training.train_utils import soft_labels_to_hard_labels
 from src.training.transforms import YTransform
 
 from src.performance_analysis.reg_meter import RegMeter
 import tracemalloc
 from hedgementation_utils.metrics.seg_meter import SegMeter
+from hedgementation_utils.metrics.per_hedge_analysis import (
+    calc_patch_per_hedge_accuracy,
+    calc_mean_hedge_accuracy,
+    calc_hedge_detection_rate,
+)
+from hedgementation_utils.metrics.seg_meter import SegMeter as HedgeSegMeter
 
 from datetime import datetime
 
@@ -72,36 +78,28 @@ def get_model_predictions(model,
     
     all_preds = []
     all_labels = []
+    all_id_masks = []
     total = len(dataloader)
 
     with torch.no_grad():
         for batch_idx, item in enumerate(dataloader):
             _progress_bar(batch_idx + 1, total, prefix="  Evaluating ")
-            
             if load_y_id:
-                input_tuple, labels, masks, *_ = item
+                preds, labels, y_id = get_batch_predictions(model, item, y_transform, load_y_id=load_y_id, device=device, regression=regression)
             else:
-                input_tuple, labels, *_ = item
-            inputs, dates = input_tuple[0], input_tuple[1]
-            inputs = inputs.to(device, non_blocking=True)
-            dates = dates.to(device, non_blocking=True)
-            labels = labels.to(device, non_blocking=True)
-
-            outputs = model(inputs, batch_positions=dates)
-
-            if regression:
-                preds = outputs
-            else:
-                preds = torch.argmax(outputs, dim=1)
-                if y_transform == YTransform.SOFT_TARGETS:
-                    labels = soft_labels_to_hard_labels(labels)
+                preds, labels = get_batch_predictions(model, item, y_transform, load_y_id=load_y_id, device=device, regression=regression)
 
             all_preds.append(preds)
             all_labels.append(labels)
+            if load_y_id:
+                all_id_masks.append(y_id)
 
     all_preds = torch.cat(all_preds).cpu()
     all_labels = torch.cat(all_labels).cpu()
-
+    if load_y_id:
+        all_y_id = torch.cat(all_id_masks).cpu()
+        return all_preds, all_labels, all_y_id
+    
     return all_preds, all_labels
 
 def calculate_all_metrics(labels: torch.Tensor,
@@ -611,11 +609,17 @@ def evaluate_per_patch_performance(model,
                                    metadata: gpd.GeoDataFrame, 
                                    dataloader, 
                                    save_path,
-                                   regression=False, 
-                                   num_buckets=1,
+                                   regression,
+                                   num_buckets,
                                    save_data=True,
                                    file_name=None,
-                                   device=None):
+                                   device=None,
+                                   load_y_id=False):
+    patch_metrics = []
+    preds = []
+    mean_hedge_accs = []
+    hedge_detection_rates = []
+    all_per_hedge_accs = []
 
     if device is None:
         device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -623,13 +627,13 @@ def evaluate_per_patch_performance(model,
     model.eval()
     model = model.to(device)
 
-    patch_metrics = []
-    preds = []
-
+    per_hedge_meter = HedgeSegMeter(num_classes=num_buckets+1) if load_y_id else None
 
     with torch.no_grad():
-        for item in dataloader:
-            input_tuple, y, *_ = item
+        for (i,item) in enumerate(dataloader):
+            _progress_bar(i + 1, len(dataloader), prefix="  Evaluating per patch ")
+            input_tuple, y, *rest = item
+            masks_raw = rest[0] if rest else {}
             X, dates = input_tuple[0], input_tuple[1]
             X = X.to(device)
             dates = dates.to(device)
@@ -649,17 +653,50 @@ def evaluate_per_patch_performance(model,
                                                      num_buckets=num_buckets,
                                                      regression=regression)
                 patch_metrics.append(metrics_dict)
-                preds.append(current_patch_preds.cpu())
+                preds.append(current_patch_preds)
+
+                if load_y_id and "y_id" in masks_raw:
+                    y_id_i = masks_raw["y_id"][i].cpu()
+                    patch_per_hedge_acc = calc_patch_per_hedge_accuracy(
+                        predictions=current_patch_preds.cpu(),
+                        target_raster=y_id_i,
+                        seg_meter=per_hedge_meter,
+                    )
+                    all_per_hedge_accs.append(patch_per_hedge_acc)
+                    mean_hedge_accs.append(calc_mean_hedge_accuracy(patch_per_hedge_acc).item())
+                    hedge_detection_rates.append(calc_hedge_detection_rate(patch_per_hedge_acc).item())
+
+    name_to_use = file_name if file_name else "metadata_with_performance"
 
     if regression:
         for key in ["mae", "mse", "rmse", "r2"]:
-            metadata[key] = [m[key] for m in patch_metrics]
-    
+            metadata[key] = np.squeeze(np.array([metrics_dict[key] for metrics_dict in patch_metrics]))
+
+        if load_y_id and all_per_hedge_accs:
+            metadata["mean_hedge_accuracy"] = mean_hedge_accs
+            metadata["hedge_detection_rate"] = hedge_detection_rates
+
+            pooled = torch.cat(all_per_hedge_accs)
+            pooled_metrics = {
+                "mean_hedge_accuracy": calc_mean_hedge_accuracy(pooled).item(),
+                "hedge_detection_rate": calc_hedge_detection_rate(pooled).item(),
+            }
+            print(f"Mean hedge accuracy (per-hedgerow): {pooled_metrics['mean_hedge_accuracy']:.4f}")
+            print(f"Hedge detection rate (per-hedgerow): {pooled_metrics['hedge_detection_rate']:.4f}")
+
+            if save_data:
+                with open(f"{save_path}/{name_to_use}_per_hedge_metrics.json", "w+") as f:
+                    json.dump(pooled_metrics, f, indent=4)
+
     else:
         for key in ["iou", "precision", "recall", "f1"]:
-            metadata[key] = [m[key] for m in patch_metrics]
+            metadata[key] = np.squeeze(np.array([metrics_dict[key] for metrics_dict in patch_metrics]))
 
     if save_data:
-        name_to_use = file_name if file_name else "metadata_with_performance"
         metadata.to_file(f"{save_path}/{name_to_use}.geojson")
+        try:
+            preds_tensor = torch.stack(preds)
+            torch.save(preds_tensor, pathlib.Path(save_path, "full_dataset_predictions.pt"))
+        except Exception as e:
+            print(f"Exception when saving predictions: {e}")
     return metadata

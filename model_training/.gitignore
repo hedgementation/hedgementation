@@ -1,4 +1,7 @@
 .venv/*
+.venv
+*.db
+scripts/*.sh
 data/*
 models/*
 .claude/*

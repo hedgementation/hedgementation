@@ -11,6 +11,7 @@ import seaborn as sns
 from scipy import stats
 import torch
 from src.performance_analysis.evaluate_model import get_model_predictions
+from hedgementation_utils.io.io_manager import HedgementationIOManager
 from hedgementation_utils.metrics.seg_meter import SegMeter
 from src.training.dataloader_utils import setup_dataloader
 from dotenv import load_dotenv
@@ -293,7 +294,8 @@ class ModelPerformanceAnalyzer:
             y_transform=y_transform,
             inclusion_intervals=params["inclusion_intervals"],
             batch_size=params["batch_size"],
-            shuffle=False
+            shuffle=False,
+            load_y_id=True
         )
         preds,labels = get_model_predictions(model, 
                                              dataloader=dataloader,
