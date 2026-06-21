@@ -18,7 +18,7 @@ This tutorial assumes that you have already downloaded and set up the Hedgementa
  
 ## Replicating Different Experiments
 
-All of the experiments described in our paper correspond to pre-registered configs that can be run using the appropriate keywords in run.py. To run them, simply change the argument passed to `--keywords` in `run.py`.
+All of the experiments described in our paper correspond to pre-registered configs that can be run using the appropriate keywords in run.py. To run them, simply change the argument passed to `--keywords` in `run.py`. By default, experiments use the ``SMALL`` sizegroup, meaning they only use 2995 of the 11995 total datapoints in the 1.3 dataset. That means you only need to export those patches if you want to try running experiments yourself.
 
 - **Default model training**: `default`
 - **Near vs. Far**: `far_group_0,far_group_1,far_group_2,far_group_3,far_group_4,`
