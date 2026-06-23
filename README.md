@@ -1,6 +1,6 @@
 # Hedgementation Benchmark
 
-This repo contains all of the code necessary to build and use the [Hedgementation benchmark](https://openreview.net/forum?id=mOMTBBgq5n), train and evaluate baseline models, and train your own models on it.
+This repo contains all of the code necessary to build and use the [Hedgementation benchmark](http://arxiv.org/abs/2606.23615), train and evaluate baseline models, and train your own models on it.
 
 The repository contains 3 subfolders.
 
